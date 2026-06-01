@@ -38,6 +38,8 @@ def render_technical_details(details: dict):
         c3.metric("图表数量", details.get("chart_count", 0))
 
         st.caption(f"分析意图：{details.get('intent', '—')}")
+        if details.get("orchestrator"):
+            st.caption(f"编排框架：{details.get('orchestrator')} · 会话轮次：{details.get('conversation_turns', '—')}")
         tables = details.get("returned_tables") or []
         if tables:
             st.caption("返回数据表：" + "、".join(tables))
@@ -52,10 +54,7 @@ def render_technical_details(details: dict):
 
         llm_error = details.get("llm_error") or ""
         if llm_error:
-            st.warning(
-                "大模型生成的 SQL 执行失败，系统已自动改用本地兜底查询完成分析。"
-                " 下方为错误详情（不影响已展示的结果）。"
-            )
+            st.warning("大模型相关步骤出现异常，详情如下：")
             st.code(llm_error[:1200], language="text")
 
         notes = details.get("notes") or []

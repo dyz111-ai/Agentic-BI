@@ -46,6 +46,10 @@ def init_orchestrator(db_url: str):
 
 if "history" not in st.session_state:
     st.session_state.history = []
+if "orchestrator_memory" not in st.session_state:
+    st.session_state.orchestrator_memory = {"turns": []}
+if "session_thread_id" not in st.session_state:
+    st.session_state.session_thread_id = "streamlit-default"
 if "last_input" not in st.session_state:
     st.session_state.last_input = EXAMPLES[0]
 
@@ -68,9 +72,17 @@ with st.sidebar:
         except Exception as exc:
             st.error(f"刷新失败：{exc}")
 
+    if st.button("清空会话记忆", use_container_width=True):
+        st.session_state.orchestrator_memory = {"turns": []}
+        st.session_state.history = []
+        st.success("已清空多轮对话记忆")
+
     st.markdown("---")
     st.subheader("历史对话")
     render_sidebar_history(st.session_state.history)
+    turns = len(st.session_state.orchestrator_memory.get("turns") or [])
+    if turns:
+        st.caption(f"LangGraph 会话记忆：已保留 {turns} 轮上下文")
 
 st.subheader("自然语言提问")
 user_question = st.text_area(
@@ -89,8 +101,13 @@ if run and user_question.strip():
     st.session_state.last_input = user_question
     try:
         orch = init_orchestrator(DB_URL)
-        with st.spinner("Agent 正在查询、分析、画图和生成建议..."):
-            result = orch.handle(user_question)
+        with st.spinner("LangGraph Agent 正在查询、分析、画图和生成建议..."):
+            result = orch.handle(
+                user_question,
+                memory=st.session_state.orchestrator_memory,
+                thread_id=st.session_state.session_thread_id,
+            )
+        st.session_state.orchestrator_memory = result.memory
         render_report(result)
         st.session_state.history.append({
             "question": user_question,
@@ -111,10 +128,10 @@ else:
     st.info("在上方输入问题后点击「开始分析」。")
     st.markdown(
         """
-        这个系统会自动完成：
-        1. 协调器 Agent 判断任务类型；
-        2. 数据分析 Agent 优先查询预聚合表；
-        3. 可视化 Agent 自动生成图表；
+        这个系统会自动完成（LangGraph StateGraph 编排）：
+        1. 协调器 Agent 判断任务类型并维护多轮会话记忆；
+        2. 数据分析 Agent 优先查询预聚合表（支持追问上下文）；
+        3. 可视化 Agent LLM 规划图表（含词云 wordcloud）；
         4. 评论洞察 Agent 分析差评关键词；
         5. 预测 Agent 预测未来 6 周 GMV；
         6. 决策智能 Agent 输出运营建议。

@@ -41,12 +41,29 @@ class DataAnalysisAgent:
         self.engine = engine
         self.llm = LLMClient()
 
-    def analyze(self, question: str) -> DataResult:
+    def analyze(self, question: str, conversation_context: str = "") -> DataResult:
         self.llm.require_enabled()
-        return self._llm_analyze(question)
+        return self._llm_analyze(question, conversation_context=conversation_context)
 
-    def _llm_analyze(self, question: str) -> DataResult:
-        plan = self._ask_llm_for_plan(question)
+    def _llm_analyze(self, question: str, conversation_context: str = "") -> DataResult:
+        plan = self._ask_llm_for_plan(question, conversation_context=conversation_context)
+        result = self._execute_plan(plan)
+
+        issues = self._coverage_issues(question, result)
+        if issues:
+            feedback = "上次 SQL 结果不足以回答问题：" + "；".join(issues)
+            plan = self._ask_llm_for_plan(
+                question,
+                conversation_context=conversation_context,
+                retry_feedback=feedback,
+            )
+            result = self._execute_plan(plan)
+            result.plan = plan
+
+        result.summary = self._build_summary(result, plan)
+        return result
+
+    def _execute_plan(self, plan: dict) -> DataResult:
         intent = str(plan.get("intent", "custom_sql")).strip()
         if intent not in self.ALLOWED_INTENTS:
             intent = "custom_sql"
@@ -80,12 +97,84 @@ class DataAnalysisAgent:
             raise ValueError("LLM 返回的 SQL 均为空或无法执行")
 
         result.used_preaggregation = bool(result.used_preaggregation and not any_base)
-        result.summary = self._build_summary(result, plan)
         return result
 
-    def _ask_llm_for_plan(self, question: str) -> dict:
+    def _coverage_issues(self, question: str, result: DataResult) -> list[str]:
+        """Detect common LLM SQL mistakes (e.g. LIMIT on state-month grain)."""
+        wants_trend = any(k in question for k in ["趋势", "按月", "每月", "月度", "monthly", "trend", "怎样", "如何"])
+        wants_state = any(k in question for k in ["州", "各州", "排名", "state", "region", "区域"])
+        issues: list[str] = []
+
+        monthly_month_count = 0
+        for name, df in result.tables.items():
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            col_map = {str(c).lower(): c for c in df.columns}
+            if "year_month" not in col_map:
+                continue
+            ym = col_map["year_month"]
+            month_count = df[ym].astype(str).nunique()
+            monthly_month_count = max(monthly_month_count, month_count)
+
+            if wants_state and "customer_state" in col_map and month_count == 1 and len(df) <= 30:
+                issues.append(
+                    f"表 `{name}` 只有 1 个月份（{df[ym].iloc[0]}）的各州明细，"
+                    "疑似对 mv_state_sales 直接 LIMIT；全年各州排名应 GROUP BY customer_state 汇总"
+                )
+
+        if wants_trend and monthly_month_count < 2:
+            issues.append(
+                "缺少覆盖多个月的月度序列；趋势问题应单独查 mv_monthly_sales "
+                "(SELECT year_month, total_gmv ... ORDER BY year_month)，不要只靠 mv_state_sales 小 LIMIT"
+            )
+
+        if wants_trend and wants_state and monthly_month_count >= 2:
+            has_state_month_grid = any(
+                isinstance(df, pd.DataFrame)
+                and not df.empty
+                and {"year_month", "customer_state"}.issubset({str(c).lower() for c in df.columns})
+                and df[[c for c in df.columns if str(c).lower() == "year_month"][0]].astype(str).nunique() >= 2
+                for df in result.tables.values()
+            )
+            if not has_state_month_grid and monthly_month_count < 2:
+                issues.append(
+                    "若需「按月各州趋势」，应查 mv_state_sales WHERE year_month LIKE '2017-%' "
+                    "返回 year_month + customer_state + total_gmv，LIMIT 5000，禁止 LIMIT 10"
+                )
+
+        return self._dedupe_issues(issues)
+
+    @staticmethod
+    def _dedupe_issues(issues: list[str]) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in issues:
+            if item not in seen:
+                seen.add(item)
+                out.append(item)
+        return out
+
+    def _ask_llm_for_plan(
+        self,
+        question: str,
+        conversation_context: str = "",
+        retry_feedback: str = "",
+    ) -> dict:
         dialect = self.engine.dialect.name
         schema_text = self._schema_prompt()
+        context_block = ""
+        if conversation_context.strip():
+            context_block = f"""
+{conversation_context}
+当前问题可能是追问，请结合上文中的州名、品类、支付方式、时间范围等实体生成 SQL。
+"""
+        retry_block = ""
+        if retry_feedback.strip():
+            retry_block = f"""
+【重要：上次 SQL 结果不完整，请修正】
+{retry_feedback}
+请重新规划 queries，确保能完整回答用户问题。
+"""
         prompt = f"""
 你是 Agentic BI 系统中的 Data Analysis Agent。把业务问题转换为可执行 SQL。
 
@@ -101,10 +190,17 @@ class DataAnalysisAgent:
 7. used_preaggregation 表示是否主要命中预聚合表。
 8. 品类翻译表列名是 product_category_name_english，不是 product_category_english（后者可在 SELECT 里 AS 别名）。
 9. 对年份过滤可用 year_month LIKE '2017-%'。
+10. 复合问题必须拆成多条 query（最多 3 条），各司其职：
+    - 「月度 GMV / 趋势 / 按月」→ 查 mv_monthly_sales：SELECT year_month, total_gmv FROM mv_monthly_sales WHERE year_month LIKE '2017-%' ORDER BY year_month（不要用 LIMIT 截断月份）。
+    - 「各州排名 / 哪个州最高」（全年）→ 查 mv_state_sales 并 GROUP BY customer_state：SELECT customer_state, SUM(total_gmv) AS total_gmv FROM mv_state_sales WHERE year_month LIKE '2017-%' GROUP BY customer_state ORDER BY total_gmv DESC LIMIT 20。
+    - 「按月各州趋势」→ SELECT year_month, customer_state, total_gmv FROM mv_state_sales WHERE year_month LIKE '2017-%' ORDER BY year_month, total_gmv DESC LIMIT 5000。
+11. 严禁对 mv_state_sales / mv_delivery_perf 等「年-月-州」粒度明细表直接 LIMIT 10/20 来回答排名或趋势——这只会返回第一个月的若干行。
+12. 需要全年 GMV 总额时，对 mv_monthly_sales 的 total_gmv 求 SUM，或对 mv_state_sales 按州汇总后再加总。
 
 数据字典：
 {schema_text}
-
+{context_block}
+{retry_block}
 用户问题：{question}
 
 返回 JSON：

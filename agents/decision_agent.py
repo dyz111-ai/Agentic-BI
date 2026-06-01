@@ -33,10 +33,11 @@ class DecisionIntelligenceAgent:
         data_result: Any,
         nlp_result: Any = None,
         forecast_result: Any = None,
+        conversation_context: str = "",
     ) -> DecisionResult:
         self.llm.require_enabled()
         evidence = self._build_evidence_packet(data_result, nlp_result, forecast_result)
-        prompt = self._build_llm_prompt(question, evidence)
+        prompt = self._build_llm_prompt(question, evidence, conversation_context=conversation_context)
         text = self.llm.chat(
             [
                 {
@@ -62,9 +63,11 @@ class DecisionIntelligenceAgent:
             summary="已基于真实查询结果、评论洞察和预测结果生成决策建议。",
         )
 
-    def _build_llm_prompt(self, question: str, evidence: dict[str, Any]) -> str:
+    def _build_llm_prompt(self, question: str, evidence: dict[str, Any], conversation_context: str = "") -> str:
         evidence_json = json.dumps(evidence, ensure_ascii=False, default=str, indent=2)
+        context_block = f"\n{conversation_context}\n" if conversation_context.strip() else ""
         return f"""
+{context_block}
 用户问题：{question}
 
 下面是系统真实查询和分析得到的 evidence_json。你只能引用这里出现的数据、品类、州、卖家、关键词、预测值。
