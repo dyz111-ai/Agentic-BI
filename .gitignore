@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment & secrets
+.env
+.env.local
+.streamlit/secrets.toml
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Logs & temp
+*.log
+*.tmp
+_debug_*.py
+
+# Data (Kaggle CSV 体积大，本地导入即可)
+data/raw/*.csv
+data/raw/*.zip
+data/*.db
+data/sample_olist.db
+
+# 保留 data 目录说明文件
+!data/raw/README.md
+!data/sample/
+!data/sample/README.md
+
+# 运行生成的图表
+outputs/charts/*.html
+outputs/charts/*.png
+outputs/charts/*.jpg
+outputs/charts/*.jpeg
+
+# 可选：若不想提交 backup 副本，取消下面注释
+# agents/backup/
