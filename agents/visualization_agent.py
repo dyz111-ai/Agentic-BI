@@ -126,7 +126,7 @@ class VisualizationAgent:
 
 规则：
 1. 只返回严格 JSON，不要 Markdown。
-2. charts 中每个元素必须包含：title, type, table, x, y（pie/heatmap/wordcloud 可省略 y 或改用 names/values/index/columns）。
+2. charts 中每个元素必须包含：title, type, table, x, y（pie/heatmap/wordcloud 可省略 y 或改用 names/values/index/columns；line 多系列可加 color）。
 3. type 只能是：line, bar, bar_h, pie, scatter, heatmap, geo_scatter, keyword_bar, wordcloud。
 4. table 必须是上面列出的表名之一（NLP 表以 nlp_ 开头）。
 5. x/y/names/values/index/columns 必须是该表真实存在的列名。
@@ -138,22 +138,36 @@ class VisualizationAgent:
 8. 支付方式占比可用 pie；两类别交叉可用 heatmap（index, columns, values）。
 9. keyword_bar 用于 nlp_negative_keywords / nlp_positive_keywords 的柱状排名（x=keyword, y=count）。
 10. wordcloud 用于 nlp_negative_keywords / nlp_positive_keywords 的真正词云（x=keyword, y=count）；评论/差评主题问题应优先至少规划 1 个 wordcloud。
-11. 若表含 year_month 且问题是各州排名（非按月趋势），应用聚合后的表或只选 summary 表，不要画 27 州 × 12 月杂乱热力图。
-12. 若无法从数据得出合理图表，返回空 charts 数组，不要编造列名。
-13. 折线图若需叠加预测，设置 overlay_forecast=true。
-14. 每种问题选 2-4 张图即可，不要堆砌重复含义的图。
+11. 时间序列折线图约定：
+    - 全平台月度 GMV（表只有 year_month + total_gmv）→ type=line, x=year_month, y=total_gmv，不要设 color。
+    - 各州按月 GMV 趋势（表含 year_month + customer_state + total_gmv）→ 二选一：
+      (a) type=line, x=year_month, y=total_gmv, color=customer_state（多折线，Top 州）
+      (b) type=heatmap, index=customer_state, columns=year_month, values=total_gmv（州×月矩阵）
+    - 全年各州排名（不要按月）→ type=bar_h, x=total_gmv, y=customer_state，用已按州聚合的表。
+12. 禁止对「州×月」明细表只画 x=year_month,y=total_gmv 且无 color 的单折线（会把多州数据混在一起误导）。
+13. 若无法从数据得出合理图表，返回空 charts 数组，不要编造列名。
+14. 折线图若需叠加预测，设置 overlay_forecast=true（仅全平台月度 GMV 折线）。
+15. 每种问题选 2-4 张图即可，不要堆砌重复含义的图。
 
 返回格式：
 {{
   "reason": "为何选择这些图表",
   "charts": [
     {{
-      "title": "月度 GMV 趋势",
+      "title": "2017 全平台月度 GMV 趋势",
       "type": "line",
       "table": "monthly_trend",
       "x": "year_month",
+      "y": "total_gmv"
+    }},
+    {{
+      "title": "Top 州月度 GMV 趋势",
+      "type": "line",
+      "table": "state_monthly",
+      "x": "year_month",
       "y": "total_gmv",
-      "overlay_forecast": false
+      "color": "customer_state",
+      "limit": 8
     }}
   ]
 }}
@@ -299,25 +313,79 @@ class VisualizationAgent:
     ) -> go.Figure | None:
         if x not in df.columns or y not in df.columns:
             return None
-        work = df[[x, y]].copy()
+
+        work = df.copy()
         work[y] = pd.to_numeric(work[y], errors="coerce")
         if str(x).lower() in {"year_month", "month"}:
             work["date"] = pd.to_datetime(work[x].astype(str).str[:7] + "-01", errors="coerce")
         else:
             work["date"] = pd.to_datetime(work[x], errors="coerce")
-        work = work.dropna(subset=["date", y]).sort_values("date")
+        work = work.dropna(subset=["date", y])
         if work.empty:
             return None
 
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=work["date"], y=work[y], mode="lines+markers", name=str(y)))
+        color_col = self._find_col(work, spec.get("color")) or self._find_state_col(work)
+        multi_series = (
+            color_col
+            and color_col in work.columns
+            and work[color_col].nunique() > 1
+        )
+
+        if multi_series:
+            limit = int(spec.get("limit") or 8)
+            top_states = (
+                work.groupby(color_col)[y]
+                .sum()
+                .sort_values(ascending=False)
+                .head(limit)
+                .index
+            )
+            work = work[work[color_col].isin(top_states)].sort_values(["date", color_col])
+            fig = px.line(
+                work,
+                x="date",
+                y=y,
+                color=color_col,
+                markers=True,
+                labels={"date": str(x), y: y, color_col: color_col},
+            )
+            fig.update_layout(xaxis_title=str(x), yaxis_title=str(y), legend_title=str(color_col))
+            return self._finalize_fig(fig)
+
+        # Single series: aggregate duplicate dates (e.g. accidental multi-row same month)
+        work = work.groupby("date", as_index=False)[y].sum().sort_values("date")
+        fig = px.line(work, x="date", y=y, markers=True, labels={"date": str(x), y: y})
         if spec.get("overlay_forecast") and forecast_result is not None:
             fc = getattr(forecast_result, "forecast_df", pd.DataFrame())
             if isinstance(fc, pd.DataFrame) and not fc.empty and "date" in fc.columns and "forecast_gmv" in fc.columns:
-                fig.add_trace(go.Scatter(x=fc["date"], y=fc["forecast_gmv"], mode="lines+markers", name="预测"))
+                fig.add_trace(
+                    go.Scatter(
+                        x=fc["date"],
+                        y=fc["forecast_gmv"],
+                        mode="lines+markers",
+                        name="预测",
+                    )
+                )
                 if {"upper", "lower"}.issubset(fc.columns):
-                    fig.add_trace(go.Scatter(x=fc["date"], y=fc["upper"], mode="lines", line=dict(width=0), showlegend=False))
-                    fig.add_trace(go.Scatter(x=fc["date"], y=fc["lower"], mode="lines", fill="tonexty", name="置信区间", line=dict(width=0)))
+                    fig.add_trace(
+                        go.Scatter(
+                            x=fc["date"],
+                            y=fc["upper"],
+                            mode="lines",
+                            line=dict(width=0),
+                            showlegend=False,
+                        )
+                    )
+                    fig.add_trace(
+                        go.Scatter(
+                            x=fc["date"],
+                            y=fc["lower"],
+                            mode="lines",
+                            fill="tonexty",
+                            name="置信区间",
+                            line=dict(width=0),
+                        )
+                    )
         fig.update_layout(xaxis_title=str(x), yaxis_title=str(y))
         return self._finalize_fig(fig)
 
@@ -352,6 +420,13 @@ class VisualizationAgent:
                     work = work.sort_values(metric, ascending=False).head(limit)
             if chart_type == "bar_h":
                 work = work.sort_values(metric, ascending=True)
+
+        # Line charts: keep state×month grain; top-state filter happens in _render_line
+        if chart_type == "line" and state_col and time_col and metric and metric in work.columns:
+            work[metric] = pd.to_numeric(work[metric], errors="coerce")
+            work = work.dropna(subset=[metric, time_col])
+            if state_col in work.columns:
+                work = work.dropna(subset=[state_col])
 
         return work
 
@@ -515,8 +590,7 @@ class VisualizationAgent:
         fig.update_geos(center=dict(lat=-14, lon=-52), projection_scale=3.2)
         return self._finalize_fig(fig)
 
-    @staticmethod
-    def _render_keyword_bar(df: pd.DataFrame, x: str, y: str, title: str) -> go.Figure | None:
+    def _render_keyword_bar(self, df: pd.DataFrame, x: str, y: str, title: str) -> go.Figure | None:
         x = x or "keyword"
         y = y or "count"
         if x not in df.columns or y not in df.columns:
@@ -524,8 +598,7 @@ class VisualizationAgent:
         ordered = df.sort_values(y, ascending=True).tail(20)
         return self._finalize_fig(px.bar(ordered, x=y, y=x, orientation="h"))
 
-    @staticmethod
-    def _render_wordcloud(df: pd.DataFrame, x: str, y: str, title: str) -> go.Figure | None:
+    def _render_wordcloud(self, df: pd.DataFrame, x: str, y: str, title: str) -> go.Figure | None:
         """Render true word cloud via wordcloud + matplotlib, embedded in Plotly."""
         x = x or "keyword"
         y = y or "count"
