@@ -16,19 +16,55 @@ def _get_default_db_url() -> str:
 
 DB_URL = _get_default_db_url()
 
-
 def _ensure_project_root() -> None:
     """Ensure project root is in sys.path for direct script execution."""
     root = str(BASE_DIR)
     if root not in sys.path:
         sys.path.insert(0, root)
 
+def ensure_sample_db_if_needed(engine: Engine) -> None:
+    """Check if we have a database, and create a sample one if needed.
+    
+    This function:
+    1. Checks if orders table exists
+    2. If not, uses init_sample_db.py to create a sample database
+    3. Skips if database already has data
+    
+    Args:
+        engine: SQLAlchemy engine
+    """
+    _ensure_project_root()
+    
+    try:
+        # Check if orders table exists
+        if table_exists("orders", engine):
+            # Check if it has any data
+            with engine.connect() as conn:
+                result = conn.execute(text("SELECT COUNT(*) FROM orders"))
+                count = result.scalar() or 0
+                if count > 0:
+                    return
+        
+        # If we get here, we need to create sample data
+        from utils.init_sample_db import build_sample_database
+        db_path = BASE_DIR / "data" / "sample_olist.db"
+        build_sample_database(db_path=db_path, n_orders=800, seed=42)
+        
+    except Exception:
+        # If anything goes wrong, try to create sample data
+        try:
+            from utils.init_sample_db import build_sample_database
+            db_path = BASE_DIR / "data" / "sample_olist.db"
+            build_sample_database(db_path=db_path, n_orders=800, seed=42)
+        except Exception:
+            # If even that fails, just return and let the app handle it
+            pass
 
 def get_engine(db_url: Optional[str] = None) -> Engine:
     """Create SQLAlchemy engine with cross-database compatibility.
     
     Args:
-        db_url: Database URL. Defaults to config DB_URL.
+        db_url: Database URL. Defaults to config DB URL.
         
     Returns:
         SQLAlchemy Engine instance.
@@ -39,7 +75,6 @@ def get_engine(db_url: Optional[str] = None) -> Engine:
         db_path = url.replace("sqlite:///", "")
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     return create_engine(url, pool_pre_ping=True, future=True)
-
 
 def is_sqlite(engine: Optional[Engine] = None) -> bool:
     """Check if engine is SQLite.
@@ -54,7 +89,6 @@ def is_sqlite(engine: Optional[Engine] = None) -> bool:
         engine = get_engine()
     return engine.dialect.name == "sqlite"
 
-
 def is_mysql(engine: Optional[Engine] = None) -> bool:
     """Check if engine is MySQL.
     
@@ -68,7 +102,6 @@ def is_mysql(engine: Optional[Engine] = None) -> bool:
         engine = get_engine()
     return engine.dialect.name in ("mysql", "mariadb")
 
-
 def get_dialect(engine: Optional[Engine] = None) -> str:
     """Get database dialect name.
     
@@ -81,7 +114,6 @@ def get_dialect(engine: Optional[Engine] = None) -> str:
     if engine is None:
         engine = get_engine()
     return engine.dialect.name
-
 
 def year_month_expr(engine: Optional[Engine] = None, col: str = "timestamp_col") -> str:
     """Generate year-month extraction expression for current database.
@@ -103,7 +135,6 @@ def year_month_expr(engine: Optional[Engine] = None, col: str = "timestamp_col")
     if dialect == "sqlite":
         return f"strftime('%Y-%m', {col})"
     return f"DATE_FORMAT({col}, '%Y-%m')"
-
 
 def date_diff_expr(
     engine: Optional[Engine] = None,
@@ -128,7 +159,6 @@ def date_diff_expr(
         return f"(julianday({end_col}) - julianday({start_col}))"
     return f"DATEDIFF({end_col}, {start_col})"
 
-
 def read_df(
     sql: str,
     params: Optional[dict] = None,
@@ -147,7 +177,6 @@ def read_df(
     engine = engine or get_engine()
     with engine.connect() as conn:
         return pd.read_sql(text(sql), conn, params=params or {})
-
 
 def execute_sql(
     sql: str,
@@ -180,7 +209,6 @@ def execute_sql(
                 if stmt:
                     conn.execute(text(stmt))
 
-
 def execute_statement(
     stmt: str,
     engine: Optional[Engine] = None
@@ -209,7 +237,6 @@ def execute_statement(
             cursor.close()
             raw_conn.close()
 
-
 def timed_read_df(
     sql: str,
     params: Optional[dict] = None,
@@ -229,7 +256,6 @@ def timed_read_df(
     df = read_df(sql, params=params, engine=engine)
     elapsed = time.perf_counter() - start
     return df, elapsed
-
 
 def table_exists(table_name: str, engine: Optional[Engine] = None) -> bool:
     """Check if table or view exists in database.
@@ -261,7 +287,6 @@ def table_exists(table_name: str, engine: Optional[Engine] = None) -> bool:
     except Exception:
         return False
 
-
 def create_index_sql(table_name: str, index_name: str, columns: list, engine: Optional[Engine] = None) -> str:
     """Generate SQL to create an index.
     
@@ -270,7 +295,7 @@ def create_index_sql(table_name: str, index_name: str, columns: list, engine: Op
         index_name: Name of the index.
         columns: List of column names to include in the index.
         engine: SQLAlchemy engine (optional).
-    
+        
     Returns:
         SQL statement to create the index.
     """
@@ -279,14 +304,13 @@ def create_index_sql(table_name: str, index_name: str, columns: list, engine: Op
     indexed_columns = []
     for col in columns:
         # Special handling for columns that might be TEXT type in MySQL
-        if col in ['customer_state', 'product_category_english', 'seller_state', 'payment_type', 'seller_id']:
+        if col in ["customer_state", "product_category_english", "seller_state", "payment_type", "seller_id"]:
             indexed_columns.append(f"`{col}`(50)")
         else:
             indexed_columns.append(f"`{col}`")
     
     columns_str = ", ".join(indexed_columns)
     return f"CREATE INDEX {index_name} ON {table_name} ({columns_str})"
-
 
 def drop_table_if_exists(table_name: str, engine: Optional[Engine] = None) -> None:
     """Drop a table if it exists.
