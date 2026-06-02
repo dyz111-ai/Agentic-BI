@@ -46,12 +46,6 @@ def init_orchestrator(db_url: str):
 
 if "history" not in st.session_state:
     st.session_state.history = []
-if "orchestrator_memory" not in st.session_state:
-    st.session_state.orchestrator_memory = {"turns": []}
-if "session_thread_id" not in st.session_state:
-    st.session_state.session_thread_id = "streamlit-default"
-if "last_input" not in st.session_state:
-    st.session_state.last_input = EXAMPLES[0]
 
 with st.sidebar:
     st.header("配置")
@@ -61,33 +55,30 @@ with st.sidebar:
 
     st.subheader("推荐测试问题")
     selected = st.radio("一键选择", EXAMPLES, index=0, label_visibility="collapsed")
-    use_selected = st.button("使用该问题", use_container_width=True)
+
+    use_selected = st.button("使用该问题", width='stretch')
     if use_selected:
         st.session_state.last_input = selected
 
-    if st.button("刷新预聚合表", use_container_width=True):
+    if st.button("刷新预聚合表", width='stretch'):
         try:
             refresh_preaggregations(init_engine(DB_URL))
             st.success("预聚合表刷新成功")
         except Exception as exc:
             st.error(f"刷新失败：{exc}")
 
-    if st.button("清空会话记忆", use_container_width=True):
-        st.session_state.orchestrator_memory = {"turns": []}
+    if st.button("清空会话记忆", width='stretch'):
         st.session_state.history = []
-        st.success("已清空多轮对话记忆")
+        st.success("已清空历史记录")
 
     st.markdown("---")
     st.subheader("历史对话")
     render_sidebar_history(st.session_state.history)
-    turns = len(st.session_state.orchestrator_memory.get("turns") or [])
-    if turns:
-        st.caption(f"LangGraph 会话记忆：已保留 {turns} 轮上下文")
 
 st.subheader("自然语言提问")
 user_question = st.text_area(
     "请输入业务问题",
-    value=st.session_state.last_input,
+    value=st.session_state.get("last_input", EXAMPLES[0]),
     height=120,
     placeholder="例如：2017 年哪个州销售额最高？交付准时率是多少？",
     label_visibility="collapsed",
@@ -101,39 +92,29 @@ if run and user_question.strip():
     st.session_state.last_input = user_question
     try:
         orch = init_orchestrator(DB_URL)
-        with st.spinner("LangGraph Agent 正在查询、分析、画图和生成建议..."):
-            result = orch.handle(
-                user_question,
-                memory=st.session_state.orchestrator_memory,
-                thread_id=st.session_state.session_thread_id,
-            )
-        st.session_state.orchestrator_memory = result.memory
+        with st.spinner("正在分析数据、生成图表与建议..."):
+            result = orch.handle(user_question)
         render_report(result)
         st.session_state.history.append({
             "question": user_question,
             "answer": result.final_answer,
-            "direct_answer": getattr(result, "direct_answer", None) or [],
-            "findings": getattr(result, "findings", None) or [],
-            "recommendations": (
-                getattr(result, "recommendations", None)
-                or getattr(result.decision_result, "recommendations", None)
-                or []
-            ),
+            "direct_answer": getattr(result, "direct_answer", []),
+            "findings": getattr(result, "findings", []),
+            "recommendations": getattr(result, "decision_result", None) and getattr(result.decision_result, "recommendations", []) or [],
         })
     except SQLAlchemyError as exc:
         st.error(f"数据库错误：{exc}")
     except Exception as exc:
         st.error(f"系统运行失败：{exc}")
+        st.exception(exc)
 else:
     st.info("在上方输入问题后点击「开始分析」。")
     st.markdown(
         """
-        这个系统会自动完成（LangGraph StateGraph 编排）：
-        1. 协调器 Agent 判断任务类型并维护多轮会话记忆；
-        2. 数据分析 Agent 优先查询预聚合表（支持追问上下文）；
-        3. 可视化 Agent LLM 规划图表（含词云 wordcloud）；
-        4. 评论洞察 Agent 分析差评关键词；
-        5. 预测 Agent 预测未来 6 周 GMV；
-        6. 决策智能 Agent 输出运营建议。
+        这个系统会自动完成以下工作：
+        1. 分析问题类型并确定查询策略
+        2. 优先使用预聚合表 mv_* 加速查询
+        3. 生成合适的可视化图表
+        4. 综合各方面信息给出决策建议
         """
     )

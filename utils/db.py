@@ -300,11 +300,12 @@ def create_index_sql(table_name: str, index_name: str, columns: list, engine: Op
         SQL statement to create the index.
     """
     # Use backticks for column names to handle reserved keywords like year_month
-    # For MySQL, TEXT columns need length specification in indexes
+    # For MySQL, TEXT columns need length specification in indexes; SQLite does not support this
+    dialect = get_dialect(engine) if engine else "sqlite"
     indexed_columns = []
     for col in columns:
         # Special handling for columns that might be TEXT type in MySQL
-        if col in ["customer_state", "product_category_english", "seller_state", "payment_type", "seller_id"]:
+        if dialect == "mysql" and col in ["customer_state", "product_category_english", "seller_state", "payment_type", "seller_id"]:
             indexed_columns.append(f"`{col}`(50)")
         else:
             indexed_columns.append(f"`{col}`")

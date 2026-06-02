@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+import json
 import re
 import pandas as pd
 from sqlalchemy.engine import Engine
@@ -19,17 +20,27 @@ class DataResult:
     summary: str = ""
     used_preaggregation: bool = False
     elapsed: dict[str, float] = field(default_factory=dict)
-    routing_method: str = "llm"
+    routing_method: str = "rule"      # rule / llm / fallback
     plan: dict[str, Any] = field(default_factory=dict)
     llm_error: str = ""
 
 
 class DataAnalysisAgent:
-    """LLM-only natural-language-to-SQL agent. No rule/template fallback."""
+    """LLM-powered natural-language-to-SQL agent.
+
+    Priority:
+    1) If LLM_API_KEY is configured, call DeepSeek/OpenAI-compatible LLM to plan intent and SQL.
+    2) Validate SQL: read-only SELECT/WITH only, no destructive keywords, add LIMIT to risky base-table queries.
+    3) Execute the generated SQL.
+    4) If LLM fails or returns invalid SQL, fall back to deterministic built-in query templates.
+
+    This keeps the system demonstrable and safe: the Agent is truly LLM-driven when API is available,
+    but it still runs offline for course demos.
+    """
 
     ALLOWED_INTENTS = {
         "sales", "forecast", "delivery", "payment", "category",
-        "seller", "review", "weight_freight", "overall", "custom_sql",
+        "seller", "review", "weight_freight", "overall", "custom_sql"
     }
 
     FORBIDDEN_SQL = re.compile(
@@ -41,29 +52,23 @@ class DataAnalysisAgent:
         self.engine = engine
         self.llm = LLMClient()
 
-    def analyze(self, question: str, conversation_context: str = "") -> DataResult:
-        self.llm.require_enabled()
-        return self._llm_analyze(question, conversation_context=conversation_context)
+    def analyze(self, question: str) -> DataResult:
+        # First choice: LLM intent routing + SQL generation.
+        if self.llm.enabled:
+            try:
+                return self._llm_analyze(question)
+            except Exception as exc:
+                # Keep the app usable if LLM JSON/SQL fails.
+                fallback = self._rule_analyze(question)
+                fallback.routing_method = "fallback"
+                fallback.llm_error = str(exc)
+                return fallback
+        # Offline/demo mode.
+        return self._rule_analyze(question)
 
-    def _llm_analyze(self, question: str, conversation_context: str = "") -> DataResult:
-        plan = self._ask_llm_for_plan(question, conversation_context=conversation_context)
-        result = self._execute_plan(plan)
-
-        issues = self._coverage_issues(question, result)
-        if issues:
-            feedback = "上次 SQL 结果不足以回答问题：" + "；".join(issues)
-            plan = self._ask_llm_for_plan(
-                question,
-                conversation_context=conversation_context,
-                retry_feedback=feedback,
-            )
-            result = self._execute_plan(plan)
-            result.plan = plan
-
-        result.summary = self._build_summary(result, plan)
-        return result
-
-    def _execute_plan(self, plan: dict) -> DataResult:
+    # ----------------------- LLM planning path -----------------------
+    def _llm_analyze(self, question: str) -> DataResult:
+        plan = self._ask_llm_for_plan(question)
         intent = str(plan.get("intent", "custom_sql")).strip()
         if intent not in self.ALLOWED_INTENTS:
             intent = "custom_sql"
@@ -80,7 +85,7 @@ class DataAnalysisAgent:
 
         any_base = False
         for i, q in enumerate(queries, start=1):
-            name = str(q.get("name") or f"result_{i}").strip()
+            name = str(q.get("name") or f"llm_result_{i}").strip()
             source = str(q.get("source") or "llm-generated").strip()
             sql = str(q.get("sql") or "").strip()
             if not sql:
@@ -97,133 +102,166 @@ class DataAnalysisAgent:
             raise ValueError("LLM 返回的 SQL 均为空或无法执行")
 
         result.used_preaggregation = bool(result.used_preaggregation and not any_base)
+        self._ensure_chart_friendly_tables(question, result)
+        result.summary = self._build_summary(result, plan)
         return result
 
-    def _coverage_issues(self, question: str, result: DataResult) -> list[str]:
-        """Detect common LLM SQL mistakes (e.g. LIMIT on state-month grain)."""
-        wants_trend = any(k in question for k in ["趋势", "按月", "每月", "月度", "monthly", "trend", "怎样", "如何"])
-        wants_state = any(k in question for k in ["州", "各州", "排名", "state", "region", "区域"])
-        issues: list[str] = []
+    def _ensure_chart_friendly_tables(self, question: str, result: DataResult) -> None:
+        """补全 LLM 常漏的时间序列/各州汇总结构，避免可视化拿到单行汇总或无 year_month 的表。"""
+        q = question.lower()
+        needs_monthly = any(k in q for k in ["按月", "月度", "每月", "趋势", "monthly", "timeline", "over time"])
+        needs_state = any(k in q for k in ["各州", "州", "排名", "state", "region"])
 
-        monthly_month_count = 0
-        for name, df in result.tables.items():
-            if not isinstance(df, pd.DataFrame) or df.empty:
-                continue
-            col_map = {str(c).lower(): c for c in df.columns}
-            if "year_month" not in col_map:
-                continue
-            ym = col_map["year_month"]
-            month_count = df[ym].astype(str).nunique()
-            monthly_month_count = max(monthly_month_count, month_count)
+        if needs_monthly and not self._is_valid_monthly_series(result.tables.get("monthly_sales")):
+            derived = self._derive_monthly_from_tables(result.tables)
+            if derived is not None:
+                result.tables["monthly_sales"] = derived
+                result.sql_blocks.append({
+                    "name": "monthly_sales",
+                    "sql": "-- derived from state_sales or canonical mv_monthly_sales",
+                    "source": "auto-fix",
+                })
+            else:
+                year_filter = "2017" if "2017" in q else None
+                sql = self._canonical_monthly_sql(year_filter)
+                n, df, elapsed = self._run("monthly_sales", sql)
+                if not df.empty:
+                    result.tables[n] = df
+                    result.sql_blocks.append({"name": n, "sql": sql, "source": "pre-aggregation auto-fix"})
+                    result.elapsed[n] = elapsed
 
-            if wants_state and "customer_state" in col_map and month_count == 1 and len(df) <= 30:
-                issues.append(
-                    f"表 `{name}` 只有 1 个月份（{df[ym].iloc[0]}）的各州明细，"
-                    "疑似对 mv_state_sales 直接 LIMIT；全年各州排名应 GROUP BY customer_state 汇总"
-                )
-
-        if wants_trend and monthly_month_count < 2:
-            issues.append(
-                "缺少覆盖多个月的月度序列；趋势问题应单独查 mv_monthly_sales "
-                "(SELECT year_month, total_gmv ... ORDER BY year_month)，不要只靠 mv_state_sales 小 LIMIT"
-            )
-
-        if wants_trend and wants_state and monthly_month_count >= 2:
-            has_state_month_grid = any(
-                isinstance(df, pd.DataFrame)
-                and not df.empty
-                and {"year_month", "customer_state"}.issubset({str(c).lower() for c in df.columns})
-                and df[[c for c in df.columns if str(c).lower() == "year_month"][0]].astype(str).nunique() >= 2
-                for df in result.tables.values()
-            )
-            if not has_state_month_grid and monthly_month_count < 2:
-                issues.append(
-                    "若需「按月各州趋势」，应查 mv_state_sales WHERE year_month LIKE '2017-%' "
-                    "返回 year_month + customer_state + total_gmv，LIMIT 5000，禁止 LIMIT 10"
-                )
-
-        return self._dedupe_issues(issues)
+        if needs_state and not self._has_state_ranking_table(result.tables):
+            year_filter = "2017" if "2017" in q else None
+            sql = self._canonical_state_sql(year_filter)
+            name = "state_sales_2017" if year_filter else "state_sales"
+            n, df, elapsed = self._run(name, sql)
+            if not df.empty:
+                result.tables[n] = df
+                result.sql_blocks.append({"name": n, "sql": sql, "source": "pre-aggregation auto-fix"})
+                result.elapsed[n] = elapsed
 
     @staticmethod
-    def _dedupe_issues(issues: list[str]) -> list[str]:
-        seen: set[str] = set()
-        out: list[str] = []
-        for item in issues:
-            if item not in seen:
-                seen.add(item)
-                out.append(item)
-        return out
+    def _is_valid_monthly_series(df: pd.DataFrame | None) -> bool:
+        if df is None or df.empty:
+            return False
+        time_cols = [c for c in df.columns if str(c).lower() in {"year_month", "month", "date", "order_month"}]
+        if not time_cols:
+            return False
+        value_cols = [c for c in df.columns if str(c).lower() in {"total_gmv", "gmv", "sales", "revenue", "total_value"}]
+        return bool(value_cols)
 
-    def _ask_llm_for_plan(
-        self,
-        question: str,
-        conversation_context: str = "",
-        retry_feedback: str = "",
-    ) -> dict:
+    @staticmethod
+    def _derive_monthly_from_tables(tables: dict[str, pd.DataFrame]) -> pd.DataFrame | None:
+        for key in ("state_sales", "state_sales_2017", "monthly_sales"):
+            df = tables.get(key)
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            if "year_month" in df.columns and "total_gmv" in df.columns:
+                out = df.groupby("year_month", as_index=False)["total_gmv"].sum().sort_values("year_month")
+                if not out.empty:
+                    return out
+        return None
+
+    @staticmethod
+    def _has_state_ranking_table(tables: dict[str, pd.DataFrame]) -> bool:
+        for key in ("state_sales", "state_sales_2017"):
+            df = tables.get(key)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                if {"customer_state", "total_gmv"}.issubset(df.columns):
+                    return True
+        return False
+
+    @staticmethod
+    def _canonical_monthly_sql(year: str | None = None) -> str:
+        if year:
+            return f"""
+                SELECT year_month, total_gmv, total_orders, avg_basket, total_freight
+                FROM mv_monthly_sales
+                WHERE year_month LIKE '{year}-%'
+                ORDER BY year_month
+            """
+        return "SELECT year_month, total_gmv, total_orders, avg_basket, total_freight FROM mv_monthly_sales ORDER BY year_month"
+
+    @staticmethod
+    def _canonical_state_sql(year: str | None = None) -> str:
+        where = f"WHERE year_month LIKE '{year}-%'" if year else ""
+        return f"""
+            SELECT customer_state,
+                   ROUND(SUM(total_gmv), 2) AS total_gmv,
+                   SUM(total_orders) AS total_orders,
+                   SUM(unique_customers) AS unique_customers
+            FROM mv_state_sales
+            {where}
+            GROUP BY customer_state
+            ORDER BY total_gmv DESC
+            LIMIT 15
+        """
+
+    def _ask_llm_for_plan(self, question: str) -> dict:
         dialect = self.engine.dialect.name
         schema_text = self._schema_prompt()
-        context_block = ""
-        if conversation_context.strip():
-            context_block = f"""
-{conversation_context}
-当前问题可能是追问，请结合上文中的州名、品类、支付方式、时间范围等实体生成 SQL。
-"""
-        retry_block = ""
-        if retry_feedback.strip():
-            retry_block = f"""
-【重要：上次 SQL 结果不完整，请修正】
-{retry_feedback}
-请重新规划 queries，确保能完整回答用户问题。
-"""
         prompt = f"""
-你是 Agentic BI 系统中的 Data Analysis Agent。把业务问题转换为可执行 SQL。
+你是 Agentic BI 系统中的 Data Analysis Agent。你的任务是把中文/英文业务问题转换为可执行 SQL。
 
 数据库方言：{dialect}
 
 必须遵守：
-1. 只生成只读 SELECT/WITH，禁止 INSERT/UPDATE/DELETE/DROP/ALTER/CREATE。
-2. 优先使用预聚合表 mv_*；只有预聚合无法覆盖时才查基础表。
-3. 直接返回严格 JSON，不要 Markdown，不要思考过程。
-4. queries 最多 3 条，每条 SQL 尽量 LIMIT 5000。
-5. 每条 query 的 name 用简短英文标识（如 monthly_trend、state_rank），不要重复。
-6. intent 从以下选择：sales, forecast, delivery, payment, category, seller, review, weight_freight, overall, custom_sql。
+1. 只生成只读 SELECT 查询，不允许 INSERT/UPDATE/DELETE/DROP/ALTER/CREATE 等操作。
+2. 优先使用预聚合表 mv_*。只有预聚合表无法覆盖评论文本、商品重量/体积、具体订单明细等问题时，才回退基础表。
+3. 直接返回严格 JSON，不要 Markdown，不要解释文字，不要输出思考过程。
+4. queries 最多 3 条。每条 SQL 尽量 LIMIT 5000 以内。
+5. 如果问题属于常见任务，请使用下列固定 name，便于后续可视化 Agent 识别：
+   - 月度销售：monthly_sales
+   - 各州销售：state_sales 或 state_sales_2017
+   - 配送：delivery_by_state 或 delivery_monthly
+   - 支付：payment_dist 或 payment_monthly
+   - 品类：top_categories 或 category_monthly
+   - 卖家：low_score_sellers
+   - 评论差评：reviews
+   - 重量运费：weight_freight
+6. intent 只能从以下选择：sales, forecast, delivery, payment, category, seller, review, weight_freight, overall, custom_sql。
 7. used_preaggregation 表示是否主要命中预聚合表。
-8. 品类翻译表列名是 product_category_name_english，不是 product_category_english（后者可在 SELECT 里 AS 别名）。
-9. 对年份过滤可用 year_month LIKE '2017-%'。
-10. 复合问题必须拆成多条 query（最多 3 条），各司其职：
-    - 「月度 GMV / 趋势 / 按月」→ 查 mv_monthly_sales：SELECT year_month, total_gmv FROM mv_monthly_sales WHERE year_month LIKE '2017-%' ORDER BY year_month（不要用 LIMIT 截断月份）。
-    - 「各州排名 / 哪个州最高」（全年）→ 查 mv_state_sales 并 GROUP BY customer_state：SELECT customer_state, SUM(total_gmv) AS total_gmv FROM mv_state_sales WHERE year_month LIKE '2017-%' GROUP BY customer_state ORDER BY total_gmv DESC LIMIT 20。
-    - 「按月各州趋势」→ SELECT year_month, customer_state, total_gmv FROM mv_state_sales WHERE year_month LIKE '2017-%' ORDER BY year_month, total_gmv DESC LIMIT 5000。
-11. 严禁对 mv_state_sales / mv_delivery_perf 等「年-月-州」粒度明细表直接 LIMIT 10/20 来回答排名或趋势——这只会返回第一个月的若干行。
-12. 需要全年 GMV 总额时，对 mv_monthly_sales 的 total_gmv 求 SUM，或对 mv_state_sales 按州汇总后再加总。
+8. 对年份过滤，推荐使用 year_month LIKE '2017-%'；对时间戳字符串可使用 substr(order_purchase_timestamp,1,7)。
+9. 品类英文名在 product_category_name_translation 表中的列名是 product_category_name_english（不是 product_category_english）。
+   预聚合表 mv_category_sales 才有 product_category_english 列。JOIN 翻译表时请写：
+   COALESCE(t.product_category_name_english, p.product_category_name, 'unknown') AS product_category_english
+10. 评论/差评问题：name 必须为 reviews，SQL 需包含 review_score、review_comment_title、review_comment_message、product_category_english。
+11. 若用户问「按月/趋势/月度」：monthly_sales 必须返回 year_month + total_gmv 的时间序列（多行），不要只返回一个 SUM 总数。
+12. 若用户问「各州/排名」：state_sales 或 state_sales_2017 需按 customer_state 汇总 total_gmv，可含 year_month 明细或已聚合结果。
 
-数据字典：
+可用数据字典：
 {schema_text}
-{context_block}
-{retry_block}
+
 用户问题：{question}
 
-返回 JSON：
+请返回 JSON 格式：
 {{
   "intent": "sales",
   "used_preaggregation": true,
-  "reason": "为什么选择这些表和字段",
+  "reason": "为什么选择这些表",
   "queries": [
-    {{"name": "monthly_trend", "source": "pre-aggregation", "sql": "SELECT ..."}}
+    {{"name": "monthly_sales", "source": "pre-aggregation", "sql": "SELECT ..."}}
   ]
 }}
 """
         messages = [
-            {"role": "system", "content": "你是严谨的数据分析 SQL Agent，只返回合法 JSON。"},
+            {"role": "system", "content": "你是严谨的数据分析 SQL Agent。只返回合法 JSON，不要思考过程，不要 Markdown。"},
             {"role": "user", "content": prompt},
         ]
         last_error = "LLM 未返回内容"
         for max_tokens in (4096, 8192):
             content = self.llm.chat(messages=messages, temperature=0.0, max_tokens=max_tokens)
+            if not content:
+                last_error = "LLM 未返回内容"
+                continue
+            if content.startswith("LLM 调用失败"):
+                last_error = content
+                continue
             try:
-                return LLMClient.extract_json(content)
-            except ValueError as exc:
-                last_error = str(exc)
+                return self._extract_json(content)
+            except (json.JSONDecodeError, ValueError) as exc:
+                last_error = f"LLM 返回 JSON 无法解析：{exc}"
+                continue
         raise ValueError(last_error)
 
     def _schema_prompt(self) -> str:
@@ -245,26 +283,350 @@ class DataAnalysisAgent:
         ])
         return "\n".join(lines)
 
+    def _extract_json(self, content: str) -> dict:
+        text = content.strip()
+        # Remove optional markdown fences.
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # Try to recover the first JSON object.
+            m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+            if not m:
+                raise
+            return json.loads(m.group(0))
+
     def _sanitize_sql(self, sql: str, source: str = "") -> str:
-        s = sql.strip().rstrip(";").strip()
+        s = sql.strip()
+        # Only allow one statement. Remove trailing semicolon; reject internal semicolons.
+        s = s.rstrip(";").strip()
         if ";" in s:
             raise ValueError("SQL 包含多个语句，已拒绝执行")
         if self.FORBIDDEN_SQL.search(s):
             raise ValueError("SQL 包含危险关键字，已拒绝执行")
         if not re.match(r"^(select|with)\b", s, flags=re.IGNORECASE):
             raise ValueError("只允许 SELECT/WITH 查询")
-        if "base" in source.lower() and not re.search(r"\blimit\b", s, flags=re.IGNORECASE):
+        # Avoid huge base-table result sets. Pre-aggregation tables are small, but base fallback can be large.
+        source_l = source.lower()
+        if "base" in source_l and not re.search(r"\blimit\b", s, flags=re.IGNORECASE):
             s += " LIMIT 5000"
         return s
 
     def _build_summary(self, result: DataResult, plan: dict) -> str:
-        reason = (plan.get("reason") or "").strip()
-        strategy = "本次优先命中预聚合表。" if result.used_preaggregation else "本次包含基础表查询。"
-        parts = ["LLM 已完成问题理解、表选择与 SQL 生成。", strategy]
+        prefix = "LLM 已完成问题理解、表选择与 SQL 生成。"
+        reason = plan.get("reason") or ""
+        if result.used_preaggregation:
+            strategy = "本次优先命中预聚合表。"
+        else:
+            strategy = "本次包含基础表回退查询。"
+
+        # Data-aware short summaries for common results.
+        details = []
+        tables = result.tables
+        try:
+            if "state_sales_2017" in tables and not tables["state_sales_2017"].empty:
+                row = tables["state_sales_2017"].iloc[0]
+                details.append(f"2017 年销售额最高的州是 {row.get('customer_state')}，GMV 约 {float(row.get('total_gmv', 0)):.2f}。")
+            elif "state_sales" in tables and not tables["state_sales"].empty and "total_gmv" in tables["state_sales"].columns:
+                row = tables["state_sales"].sort_values("total_gmv", ascending=False).iloc[0]
+                details.append(f"销售额最高的州是 {row.get('customer_state')}，GMV 约 {float(row.get('total_gmv', 0)):.2f}。")
+            if "payment_dist" in tables and not tables["payment_dist"].empty:
+                row = tables["payment_dist"].iloc[0]
+                details.append(f"最受欢迎的支付方式是 {row.get('payment_type')}。")
+            if "delivery_by_state" in tables and not tables["delivery_by_state"].empty:
+                row = tables["delivery_by_state"].iloc[0]
+                if "avg_delivery_days" in row:
+                    details.append(f"配送最慢的州是 {row.get('customer_state')}，平均配送约 {float(row.get('avg_delivery_days', 0)):.2f} 天。")
+            if "top_categories" in tables and not tables["top_categories"].empty:
+                row = tables["top_categories"].iloc[0]
+                details.append(f"销售额最高/重点品类是 {row.get('product_category_english')}。")
+            if "reviews" in tables:
+                details.append("评论文本问题已查询评论与商品品类相关基础表，后续交给评论洞察 Agent 提取差评原因。")
+            if "weight_freight" in tables:
+                details.append("重量/尺寸/运费问题已查询商品物理属性与运费明细基础表。")
+        except Exception:
+            pass
+
+        parts = [prefix, strategy]
         if reason:
             parts.append(f"选择原因：{reason}")
+        parts.extend(details)
         return " ".join(parts)
+
+    # ----------------------- deterministic fallback path -----------------------
+    def _rule_analyze(self, question: str) -> DataResult:
+        q = question.lower()
+        if self._is_overall(q):
+            return self._overall()
+        if self._has_forecast(q):
+            return self._forecast_data()
+        if self._has_review(q):
+            return self._review_data()
+        if self._has_weight_freight(q):
+            return self._weight_freight()
+        if self._has_delivery(q):
+            return self._delivery()
+        if self._has_payment(q):
+            return self._payment()
+        if self._has_category(q):
+            return self._category()
+        if self._has_seller(q):
+            return self._seller()
+        return self._sales()
 
     def _run(self, name: str, sql: str, params: dict | None = None):
         df, elapsed = timed_read_df(sql, params=params, engine=self.engine)
         return name, df, elapsed
+
+    @staticmethod
+    def _is_overall(q: str) -> bool:
+        keys = ["整体", "全局", "运营", "三大", "策略", "优化", "overall", "strategy"]
+        return any(k in q for k in keys)
+
+    @staticmethod
+    def _has_forecast(q: str) -> bool:
+        return any(k in q for k in ["预测", "未来", "forecast", "6周", "六周", "趋势"])
+
+    @staticmethod
+    def _has_delivery(q: str) -> bool:
+        return any(k in q for k in ["配送", "交付", "准时", "延迟", "物流", "delivery", "on-time"])
+
+    @staticmethod
+    def _has_payment(q: str) -> bool:
+        return any(k in q for k in ["支付", "分期", "payment", "installment", "付款"])
+
+    @staticmethod
+    def _has_category(q: str) -> bool:
+        return any(k in q for k in ["品类", "类别", "category", "产品类别"])
+
+    @staticmethod
+    def _has_seller(q: str) -> bool:
+        return any(k in q for k in ["卖家", "seller", "差评卖家"])
+
+    @staticmethod
+    def _has_review(q: str) -> bool:
+        return any(k in q for k in ["评论", "差评", "好评", "review", "情感", "原因"])
+
+    @staticmethod
+    def _has_weight_freight(q: str) -> bool:
+        return any(k in q for k in ["重量", "尺寸", "运费", "weight", "freight", "size"])
+
+    def _sales(self) -> DataResult:
+        result = DataResult(intent="sales", used_preaggregation=True)
+        queries = {
+            "monthly_sales": "SELECT * FROM mv_monthly_sales ORDER BY year_month",
+            "state_sales_2017": """
+                SELECT customer_state, ROUND(SUM(total_gmv), 2) AS total_gmv,
+                       SUM(total_orders) AS total_orders,
+                       SUM(unique_customers) AS unique_customers
+                FROM mv_state_sales
+                WHERE year_month LIKE '2017-%'
+                GROUP BY customer_state
+                ORDER BY total_gmv DESC
+                LIMIT 15
+            """,
+        }
+        for name, sql in queries.items():
+            n, df, e = self._run(name, sql)
+            result.tables[n] = df
+            result.sql_blocks.append({"name": name, "sql": sql, "source": "pre-aggregation"})
+            result.elapsed[n] = e
+        top = "暂无数据"
+        if not result.tables["state_sales_2017"].empty:
+            row = result.tables["state_sales_2017"].iloc[0]
+            top = f"2017 年销售额最高的州是 {row['customer_state']}，GMV 约 {row['total_gmv']:.2f}。"
+        result.summary = f"本地兜底：已优先使用 mv_monthly_sales 与 mv_state_sales。{top}"
+        return result
+
+    def _forecast_data(self) -> DataResult:
+        result = DataResult(intent="forecast", used_preaggregation=True)
+        sql = "SELECT * FROM mv_monthly_sales ORDER BY year_month"
+        n, df, e = self._run("monthly_sales", sql)
+        result.tables[n] = df
+        result.sql_blocks.append({"name": n, "sql": sql, "source": "pre-aggregation"})
+        result.elapsed[n] = e
+        result.summary = "本地兜底：已使用 mv_monthly_sales 获取历史 GMV 序列，用于未来 6 周预测。"
+        return result
+
+    def _delivery(self) -> DataResult:
+        result = DataResult(intent="delivery", used_preaggregation=True)
+        queries = {
+            "delivery_by_state": """
+                SELECT customer_state,
+                       ROUND(AVG(avg_delivery_days), 2) AS avg_delivery_days,
+                       ROUND(AVG(on_time_rate), 4) AS on_time_rate,
+                       SUM(delayed_orders) AS delayed_orders,
+                       SUM(total_orders) AS total_orders
+                FROM mv_delivery_perf
+                GROUP BY customer_state
+                ORDER BY avg_delivery_days DESC
+            """,
+            "delivery_monthly": "SELECT * FROM mv_delivery_perf ORDER BY year_month, avg_delivery_days DESC",
+        }
+        for name, sql in queries.items():
+            n, df, e = self._run(name, sql)
+            result.tables[n] = df
+            result.sql_blocks.append({"name": name, "sql": sql, "source": "pre-aggregation"})
+            result.elapsed[n] = e
+        if not result.tables["delivery_by_state"].empty:
+            row = result.tables["delivery_by_state"].iloc[0]
+            result.summary = f"本地兜底：配送最慢的州是 {row['customer_state']}，平均配送约 {row['avg_delivery_days']} 天，准时率 {row['on_time_rate']:.2%}。"
+        else:
+            result.summary = "未查询到配送数据。"
+        return result
+
+    def _payment(self) -> DataResult:
+        result = DataResult(intent="payment", used_preaggregation=True)
+        queries = {
+            "payment_dist": """
+                SELECT payment_type,
+                       SUM(total_transactions) AS total_transactions,
+                       ROUND(AVG(avg_installments), 2) AS avg_installments,
+                       ROUND(SUM(total_value), 2) AS total_value
+                FROM mv_payment_dist
+                GROUP BY payment_type
+                ORDER BY total_transactions DESC
+            """,
+            "payment_monthly": "SELECT * FROM mv_payment_dist ORDER BY year_month, total_value DESC",
+        }
+        for name, sql in queries.items():
+            n, df, e = self._run(name, sql)
+            result.tables[n] = df
+            result.sql_blocks.append({"name": name, "sql": sql, "source": "pre-aggregation"})
+            result.elapsed[n] = e
+        if not result.tables["payment_dist"].empty:
+            row = result.tables["payment_dist"].iloc[0]
+            result.summary = f"本地兜底：最受欢迎的支付方式是 {row['payment_type']}，交易数 {int(row['total_transactions'])}，平均分期 {row['avg_installments']}。"
+        else:
+            result.summary = "未查询到支付数据。"
+        return result
+
+    def _category(self) -> DataResult:
+        result = DataResult(intent="category", used_preaggregation=True)
+        queries = {
+            "top_categories": """
+                SELECT product_category_english,
+                       ROUND(SUM(total_gmv), 2) AS total_gmv,
+                       SUM(total_orders) AS total_orders,
+                       ROUND(AVG(avg_price), 2) AS avg_price
+                FROM mv_category_sales
+                GROUP BY product_category_english
+                ORDER BY total_gmv DESC
+                LIMIT 15
+            """,
+            "category_monthly": "SELECT * FROM mv_category_sales ORDER BY year_month, total_gmv DESC",
+        }
+        for name, sql in queries.items():
+            n, df, e = self._run(name, sql)
+            result.tables[n] = df
+            result.sql_blocks.append({"name": name, "sql": sql, "source": "pre-aggregation"})
+            result.elapsed[n] = e
+        if not result.tables["top_categories"].empty:
+            row = result.tables["top_categories"].iloc[0]
+            result.summary = f"本地兜底：销售额最高的品类是 {row['product_category_english']}，GMV 约 {row['total_gmv']:.2f}。"
+        else:
+            result.summary = "未查询到品类数据。"
+        return result
+
+    def _seller(self) -> DataResult:
+        result = DataResult(intent="seller", used_preaggregation=True)
+        sql = """
+            SELECT seller_id, seller_state,
+                   ROUND(SUM(total_gmv), 2) AS total_gmv,
+                   SUM(total_orders) AS total_orders,
+                   ROUND(AVG(avg_review_score), 2) AS avg_review_score
+            FROM mv_seller_perf
+            GROUP BY seller_id, seller_state
+            HAVING total_orders >= 2
+            ORDER BY avg_review_score ASC, total_orders DESC
+            LIMIT 20
+        """
+        n, df, e = self._run("low_score_sellers", sql)
+        result.tables[n] = df
+        result.sql_blocks.append({"name": n, "sql": sql, "source": "pre-aggregation"})
+        result.elapsed[n] = e
+        result.summary = "本地兜底：已使用 mv_seller_perf 定位低评分卖家。"
+        return result
+
+    def _weight_freight(self) -> DataResult:
+        result = DataResult(intent="weight_freight", used_preaggregation=False)
+        sql = """
+            SELECT
+                p.product_weight_g,
+                (p.product_length_cm * p.product_height_cm * p.product_width_cm) AS product_volume_cm3,
+                oi.freight_value,
+                oi.price,
+                o.order_status,
+                CASE WHEN o.order_delivered_customer_date <= o.order_estimated_delivery_date THEN 'on_time' ELSE 'delayed' END AS delivery_status
+            FROM order_items oi
+            JOIN products p ON oi.product_id = p.product_id
+            JOIN orders o ON oi.order_id = o.order_id
+            WHERE p.product_weight_g IS NOT NULL AND oi.freight_value IS NOT NULL
+            LIMIT 5000
+        """
+        n, df, e = self._run("weight_freight", sql)
+        result.tables[n] = df
+        result.sql_blocks.append({"name": n, "sql": sql, "source": "base tables fallback"})
+        result.elapsed[n] = e
+        result.summary = "本地兜底：该问题需要商品重量/体积与运费字段，已回退查询 order_items + products + orders 原始表。"
+        return result
+
+    def _review_data(self) -> DataResult:
+        result = DataResult(intent="review", used_preaggregation=False)
+        sql = """
+            SELECT
+                r.order_id,
+                r.review_score,
+                r.review_comment_title,
+                r.review_comment_message,
+                COALESCE(t.product_category_name_english, p.product_category_name, 'unknown') AS product_category_english,
+                oi.seller_id
+            FROM order_reviews r
+            LEFT JOIN order_items oi ON r.order_id = oi.order_id
+            LEFT JOIN products p ON oi.product_id = p.product_id
+            LEFT JOIN product_category_name_translation t ON p.product_category_name = t.product_category_name
+            WHERE r.review_score IS NOT NULL
+            LIMIT 8000
+        """
+        n, df, e = self._run("reviews", sql)
+        result.tables[n] = df
+        result.sql_blocks.append({"name": n, "sql": sql, "source": "base tables fallback"})
+        result.elapsed[n] = e
+        result.summary = "本地兜底：评论文本与差评原因不完全在预聚合表中，已回退查询评论与商品品类原始表。"
+        return result
+
+    def _overall(self) -> DataResult:
+        result = DataResult(intent="overall", used_preaggregation=True)
+        queries = {
+            "monthly_sales": "SELECT * FROM mv_monthly_sales ORDER BY year_month",
+            "state_sales": """
+                SELECT customer_state, ROUND(SUM(total_gmv),2) AS total_gmv, SUM(total_orders) AS total_orders
+                FROM mv_state_sales GROUP BY customer_state ORDER BY total_gmv DESC LIMIT 15
+            """,
+            "delivery_by_state": """
+                SELECT customer_state, ROUND(AVG(avg_delivery_days),2) AS avg_delivery_days,
+                       ROUND(AVG(on_time_rate),4) AS on_time_rate, SUM(delayed_orders) AS delayed_orders
+                FROM mv_delivery_perf GROUP BY customer_state ORDER BY avg_delivery_days DESC LIMIT 15
+            """,
+            "top_categories": """
+                SELECT product_category_english, ROUND(SUM(total_gmv),2) AS total_gmv, SUM(total_orders) AS total_orders
+                FROM mv_category_sales GROUP BY product_category_english ORDER BY total_gmv DESC LIMIT 15
+            """,
+            "payment_dist": """
+                SELECT payment_type, SUM(total_transactions) AS total_transactions, ROUND(AVG(avg_installments),2) AS avg_installments
+                FROM mv_payment_dist GROUP BY payment_type ORDER BY total_transactions DESC
+            """,
+            "low_score_sellers": """
+                SELECT seller_id, seller_state, SUM(total_orders) AS total_orders, ROUND(AVG(avg_review_score),2) AS avg_review_score
+                FROM mv_seller_perf GROUP BY seller_id, seller_state HAVING total_orders >= 2
+                ORDER BY avg_review_score ASC, total_orders DESC LIMIT 10
+            """,
+        }
+        for name, sql in queries.items():
+            n, df, e = self._run(name, sql)
+            result.tables[n] = df
+            result.sql_blocks.append({"name": name, "sql": sql, "source": "pre-aggregation"})
+            result.elapsed[n] = e
+        result.summary = "本地兜底：已从销售、区域、配送、品类、支付、卖家六个维度调用预聚合表，生成整体运营分析。"
+        return result

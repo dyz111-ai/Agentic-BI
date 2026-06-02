@@ -50,7 +50,7 @@ def render_technical_details(details: dict):
             for name, info in agents.items():
                 status = "已调用" if info.get("called") else "未调用"
                 rows.append({"Agent": name, "状态": status, "触发依据": info.get("reason", "—")})
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
 
         llm_error = details.get("llm_error") or ""
         if llm_error:
@@ -144,7 +144,7 @@ def render_tables(tables: dict[str, pd.DataFrame]):
         return
     for name, df in tables.items():
         st.markdown(f"**{name}**")
-        st.dataframe(df.head(200), use_container_width=True)
+        st.dataframe(df.head(200), width='stretch')
 
 
 def render_figures(figures: dict):
@@ -153,7 +153,7 @@ def render_figures(figures: dict):
         return
     for name, fig in figures.items():
         st.markdown(f"**{name}**")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
 
 def render_metrics(elapsed: dict):
