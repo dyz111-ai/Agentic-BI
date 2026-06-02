@@ -1,20 +1,49 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 
 import requests
 
-from config.settings import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
+
+def _get_llm_config():
+    """Get LLM configuration from environment variables."""
+    from pathlib import Path
+    base_dir = Path(__file__).resolve().parents[1]
+    env_file = base_dir / ".env"
+    
+    if env_file.exists():
+        with open(env_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    os.environ.setdefault(key.strip(), value.strip())
+    
+    return {
+        "api_key": os.getenv("LLM_API_KEY", ""),
+        "base_url": os.getenv("LLM_BASE_URL", "https://api.deepseek.com/v1"),
+        "model": os.getenv("LLM_MODEL", "deepseek-chat"),
+    }
+
+
+_llm_config = _get_llm_config()
 
 
 class LLMClient:
     """OpenAI-compatible client. No local template fallback."""
 
-    def __init__(self, api_key: str = LLM_API_KEY, base_url: str = LLM_BASE_URL, model: str = LLM_MODEL):
-        self.api_key = (api_key or "").strip()
-        self.base_url = (base_url or "").rstrip("/")
-        self.model = (model or "").strip()
+    def __init__(
+        self, 
+        api_key: str | None = None, 
+        base_url: str | None = None, 
+        model: str | None = None
+    ):
+        config = _llm_config
+        self.api_key = (api_key or config["api_key"] or "").strip()
+        self.base_url = (base_url or config["base_url"] or "").rstrip("/")
+        self.model = (model or config["model"] or "").strip()
 
     @property
     def enabled(self) -> bool:
