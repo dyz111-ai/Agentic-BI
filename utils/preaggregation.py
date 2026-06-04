@@ -1,3 +1,4 @@
+#python utils/performance_compare.py --db-url sqlite:///data/olist.db
 from __future__ import annotations
 
 import sys
@@ -72,25 +73,12 @@ def _build_mv_monthly_sales(dialect: str) -> str:
     Columns: year_month, total_gmv, total_orders, avg_basket, total_freight
     
     NOTE: GROUP BY 使用完整日期表达式而非列别名，兼容 MySQL ONLY_FULL_GROUP_BY 模式
+    NOTE: 使用子查询而非 CTE，兼容 MySQL 5.7
     """
     ym = _get_year_month_expr(dialect, "o.order_purchase_timestamp")
     
     sql = f"""
 CREATE TABLE mv_monthly_sales AS
-WITH payment_agg AS (
-    SELECT 
-        order_id, 
-        SUM(payment_value) AS payment_value
-    FROM payments 
-    GROUP BY order_id
-), 
-item_agg AS (
-    SELECT 
-        order_id, 
-        SUM(freight_value) AS total_freight
-    FROM order_items 
-    GROUP BY order_id
-)
 SELECT
     {ym} AS `year_month`,
     ROUND(SUM(COALESCE(pa.payment_value, 0)), 2) AS total_gmv,
@@ -98,8 +86,16 @@ SELECT
     ROUND(SUM(COALESCE(pa.payment_value, 0)) / NULLIF(COUNT(DISTINCT o.order_id), 0), 2) AS avg_basket,
     ROUND(SUM(COALESCE(ia.total_freight, 0)), 2) AS total_freight
 FROM orders o
-LEFT JOIN payment_agg pa ON o.order_id = pa.order_id
-LEFT JOIN item_agg ia ON o.order_id = ia.order_id
+LEFT JOIN (
+    SELECT order_id, SUM(payment_value) AS payment_value
+    FROM payments
+    GROUP BY order_id
+) pa ON o.order_id = pa.order_id
+LEFT JOIN (
+    SELECT order_id, SUM(freight_value) AS total_freight
+    FROM order_items
+    GROUP BY order_id
+) ia ON o.order_id = ia.order_id
 WHERE o.order_purchase_timestamp IS NOT NULL
 GROUP BY {ym}
 ORDER BY `year_month`
@@ -113,18 +109,12 @@ def _build_mv_state_sales(dialect: str) -> str:
     Columns: year_month, customer_state, total_gmv, total_orders, unique_customers
     
     NOTE: GROUP BY 使用完整日期表达式而非列别名，兼容 MySQL ONLY_FULL_GROUP_BY 模式
+    NOTE: 使用子查询而非 CTE，兼容 MySQL 5.7
     """
     ym = _get_year_month_expr(dialect, "o.order_purchase_timestamp")
     
     sql = f"""
 CREATE TABLE mv_state_sales AS
-WITH payment_agg AS (
-    SELECT 
-        order_id, 
-        SUM(payment_value) AS payment_value
-    FROM payments 
-    GROUP BY order_id
-)
 SELECT
     {ym} AS `year_month`,
     c.customer_state,
@@ -133,7 +123,11 @@ SELECT
     COUNT(DISTINCT c.customer_unique_id) AS unique_customers
 FROM orders o
 JOIN customers c ON o.customer_id = c.customer_id
-LEFT JOIN payment_agg pa ON o.order_id = pa.order_id
+LEFT JOIN (
+    SELECT order_id, SUM(payment_value) AS payment_value
+    FROM payments
+    GROUP BY order_id
+) pa ON o.order_id = pa.order_id
 WHERE o.order_purchase_timestamp IS NOT NULL
 GROUP BY {ym}, c.customer_state
 ORDER BY `year_month`, total_gmv DESC
@@ -311,6 +305,7 @@ def refresh_preaggregations(engine: Optional[Engine] = None) -> None:
     _ensure_project_root()
     engine = engine or get_engine()
     dialect = get_dialect(engine)
+    print(f"[preaggregation] database dialect: {dialect}")
     
     _drop_existing_tables(engine, dialect)
     

@@ -29,7 +29,12 @@ class DecisionIntelligenceAgent:
 
     FORBIDDEN_CLAIMS = (
         "假设", "假定", "示例数据", "假设分析", "假设结果", "可能如下", "以下是假设",
-        "床垫", "家电", "家居装饰品"  # 常见幻觉例子；真实数据出现时也不建议让 LLM凭空写。
+        "床垫", "家电", "家居装饰品",
+    )
+
+    META_JARGON = (
+        "evidence_json", "evidence packet", "JSON", "ETL", "mv_monthly_sales",
+        "mv_state_sales", "预聚合层", "数据血源", "增量+全量", "order_purchase_timestamp",
     )
 
     def __init__(self):
@@ -55,7 +60,7 @@ class DecisionIntelligenceAgent:
                             SYSTEM_PROMPT
                             + "\n"
                             + DECISION_AGENT_PROMPT
-                            + "\n你必须严格基于用户提供的 evidence_json 回答，禁止编造数据。"
+                            + "\n你必须严格基于用户提供的查询结果回答，禁止编造数据；回答中禁止出现 evidence_json、JSON、ETL 等内部术语。"
                         ),
                     },
                     {"role": "user", "content": prompt},
@@ -81,21 +86,30 @@ class DecisionIntelligenceAgent:
 
     def _build_llm_prompt(self, question: str, evidence: dict[str, Any]) -> str:
         evidence_json = json.dumps(evidence, ensure_ascii=False, default=str, indent=2)
+        has_tables = bool(evidence.get("tables"))
+        empty_hint = ""
+        if not has_tables:
+            empty_hint = (
+                "\n注意：当前查询结果为空。请给出 2-3 条面向业务人员的建议："
+                "先确认订单数据是否已导入、预聚合表是否已刷新，再重新分析。"
+                "禁止写 ETL、数据血源、evidence_json 等技术用语。"
+            )
         return f"""
 用户问题：{question}
 
-下面是系统真实查询和分析得到的 evidence_json。你只能引用这里出现的数据、品类、州、卖家、关键词、预测值。
+下面是系统真实查询得到的结构化数据（仅供你阅读，不要在回答里出现 JSON 或字段名）：
 
 {evidence_json}
+{empty_hint}
 
-请基于 evidence_json 输出 3-5 条具体、可执行的电商运营建议。
+请基于上述查询结果输出 3-5 条具体、可执行的电商运营建议。
 
 硬性规则：
 1. 禁止使用“假设”“假定”“示例数据”“可能如下”等表达。
-2. 禁止编造 evidence_json 中不存在的品类、州、卖家、评分、差评率、订单量、GMV。
-3. 如果 evidence_json 没有提供某项数据，必须写“当前查询结果未提供该指标”，不要补充猜测值。
+2. 禁止编造查询结果中不存在的品类、州、卖家、评分、差评率、订单量、GMV。
+3. 若某项指标缺失，写“当前查询未返回该指标”，并给出可执行补救动作（如刷新预聚合、检查数据导入）。
 4. 如果某个品类/卖家的 total_reviews 较小，必须提示“样本量偏小，结论仅作为风险预警”。
-5. 每条建议必须包含：数据依据 + 具体动作。
+5. 每条建议用自然中文，格式为「数据依据：…。具体动作：…。」；禁止出现 evidence_json、SQL、表名等技术词。
 6. 输出格式：每条建议单独一行，以“- ”开头；不要标题、不要编号、不要 Markdown 小标题。
 """
 
@@ -117,18 +131,27 @@ class DecisionIntelligenceAgent:
             lines = [c.strip() for c in chunks if len(c.strip()) > 4]
         return lines[:8]
 
+    def _sanitize_recommendation(self, rec: str) -> str:
+        text = rec.strip()
+        text = re.sub(r"evidence_json\s*中\s*", "查询结果中", text, flags=re.IGNORECASE)
+        text = re.sub(r"\bevidence_json\b", "查询结果", text, flags=re.IGNORECASE)
+        text = re.sub(r"\bgmv_total\b", "GMV汇总", text, flags=re.IGNORECASE)
+        return text
+
     def _remove_unsafe_or_empty_recs(self, recs: list[str], evidence: dict[str, Any]) -> list[str]:
-        """过滤明显幻觉/假设式建议。"""
+        """过滤明显幻觉/假设式建议及内部术语泄露。"""
         safe: list[str] = []
         evidence_text = json.dumps(evidence, ensure_ascii=False, default=str)
         for rec in recs:
-            if not rec or len(rec.strip()) < 6:
+            cleaned = self._sanitize_recommendation(rec)
+            if not cleaned or len(cleaned.strip()) < 6:
                 continue
-            if any(bad in rec for bad in self.FORBIDDEN_CLAIMS):
-                # 如果这些词并不在 evidence 里，则视为高风险幻觉。
-                if not any(bad in evidence_text for bad in self.FORBIDDEN_CLAIMS if bad in rec):
+            if any(j in cleaned for j in self.META_JARGON):
+                continue
+            if any(bad in cleaned for bad in self.FORBIDDEN_CLAIMS):
+                if not any(bad in evidence_text for bad in self.FORBIDDEN_CLAIMS if bad in cleaned):
                     continue
-            safe.append(rec.strip())
+            safe.append(cleaned.strip())
         return safe[:5]
 
     # ------------------------------------------------------------------
@@ -316,5 +339,11 @@ class DecisionIntelligenceAgent:
             recs.append(f"预测结果显示：{fc_summary} 建议提前规划广告预算、库存补货和物流资源，避免需求变化造成缺货或配送延迟。")
 
         if not recs:
-            recs = ["当前查询结果提供的结构化指标较少。建议先补充销售、配送、支付、评论四类核心 KPI 后，再制定分区域、分品类、分卖家的运营策略。"]
+            if not tables:
+                recs = [
+                    "数据依据：当前查询未返回销售、配送、支付或评论等结构化指标。具体动作：请先确认订单 CSV 是否已导入数据库，并在系统中刷新预聚合表后重新提问。",
+                    "数据依据：无法基于空结果制定分区域或分品类策略。具体动作：完成数据导入后，优先分析 2017 年月度 GMV 与各州排名，再制定运营重点。",
+                ]
+            else:
+                recs = ["当前查询结果提供的结构化指标较少。建议先补充销售、配送、支付、评论四类核心 KPI 后，再制定分区域、分品类、分卖家的运营策略。"]
         return recs[:6]

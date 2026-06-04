@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 from typing import Optional, Union
@@ -11,16 +12,25 @@ from sqlalchemy.exc import SQLAlchemyError
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 
-def _get_default_db_url() -> str:
-    return f"sqlite:///{BASE_DIR / 'data' / 'sample_olist.db'}"
-
-DB_URL = _get_default_db_url()
 
 def _ensure_project_root() -> None:
     """Ensure project root is in sys.path for direct script execution."""
     root = str(BASE_DIR)
     if root not in sys.path:
         sys.path.insert(0, root)
+
+
+def _get_default_db_url() -> str:
+    """Read DB_URL from config/.env; fall back to bundled SQLite sample."""
+    _ensure_project_root()
+    try:
+        from config.settings import DB_URL as settings_db_url
+        return settings_db_url
+    except Exception:
+        return f"sqlite:///{BASE_DIR / 'data' / 'sample_olist.db'}"
+
+
+DB_URL = _get_default_db_url()
 
 def ensure_sample_db_if_needed(engine: Engine) -> None:
     """Check if we have a database, and create a sample one if needed.
@@ -159,6 +169,23 @@ def date_diff_expr(
         return f"(julianday({end_col}) - julianday({start_col}))"
     return f"DATEDIFF({end_col}, {start_col})"
 
+# MySQL treats YEAR as reserved; unquoted `year_month` in ORDER BY/WHERE may parse as YEAR(...) + _month
+MYSQL_QUOTED_IDENTIFIERS = ("year_month",)
+
+
+def fix_mysql_sql(sql: str, engine: Optional[Engine] = None) -> str:
+    """Quote MySQL-problematic identifiers (e.g. year_month) with backticks."""
+    if not is_mysql(engine):
+        return sql
+    fixed = sql
+    for ident in MYSQL_QUOTED_IDENTIFIERS:
+        fixed = re.sub(
+            rf"(?<!`)\b{re.escape(ident)}\b(?!`)",
+            f"`{ident}`",
+            fixed,
+        )
+    return fixed
+
 def read_df(
     sql: str,
     params: Optional[dict] = None,
@@ -175,6 +202,7 @@ def read_df(
         Query results as DataFrame.
     """
     engine = engine or get_engine()
+    sql = fix_mysql_sql(sql, engine)
     with engine.connect() as conn:
         return pd.read_sql(text(sql), conn, params=params or {})
 

@@ -7,7 +7,7 @@ import re
 import pandas as pd
 from sqlalchemy.engine import Engine
 
-from utils.db import timed_read_df
+from utils.db import timed_read_df, fix_mysql_sql
 from utils.llm import LLMClient
 from config.data_dictionary import BASE_TABLES, PRE_AGG_TABLES
 
@@ -51,6 +51,20 @@ class DataAnalysisAgent:
     def __init__(self, engine: Engine):
         self.engine = engine
         self.llm = LLMClient()
+
+    @property
+    def _dialect(self) -> str:
+        return self.engine.dialect.name
+
+    def _is_mysql(self) -> bool:
+        return self._dialect in ("mysql", "mariadb")
+
+    def _q(self, ident: str) -> str:
+        """Quote identifier for MySQL reserved words (e.g. year_month)."""
+        return f"`{ident}`" if self._is_mysql() else ident
+
+    def _adapt_sql(self, sql: str) -> str:
+        return fix_mysql_sql(sql.strip(), self.engine)
 
     def analyze(self, question: str) -> DataResult:
         # First choice: LLM intent routing + SQL generation.
@@ -106,15 +120,27 @@ class DataAnalysisAgent:
         result.summary = self._build_summary(result, plan)
         return result
 
+    def _question_needs_monthly(self, q: str) -> bool:
+        keys = [
+            "按月", "月度", "每月", "趋势", "monthly", "timeline", "over time",
+            "gmv", "销售额", "销售", "营收", "revenue", "多少", "怎样", "如何",
+        ]
+        return any(k in q for k in keys)
+
+    def _question_needs_state(self, q: str) -> bool:
+        keys = ["各州", "州", "排名", "state", "region", "区域"]
+        return any(k in q for k in keys)
+
     def _ensure_chart_friendly_tables(self, question: str, result: DataResult) -> None:
         """补全 LLM 常漏的时间序列/各州汇总结构，避免可视化拿到单行汇总或无 year_month 的表。"""
         q = question.lower()
-        needs_monthly = any(k in q for k in ["按月", "月度", "每月", "趋势", "monthly", "timeline", "over time"])
-        needs_state = any(k in q for k in ["各州", "州", "排名", "state", "region"])
+        needs_monthly = self._question_needs_monthly(q)
+        needs_state = self._question_needs_state(q)
+        year_filter = "2017" if "2017" in q else None
 
-        if needs_monthly and not self._is_valid_monthly_series(result.tables.get("monthly_sales")):
+        if needs_monthly and not self._has_usable_monthly_data(result.tables):
             derived = self._derive_monthly_from_tables(result.tables)
-            if derived is not None:
+            if derived is not None and not derived.empty:
                 result.tables["monthly_sales"] = derived
                 result.sql_blocks.append({
                     "name": "monthly_sales",
@@ -122,23 +148,47 @@ class DataAnalysisAgent:
                     "source": "auto-fix",
                 })
             else:
-                year_filter = "2017" if "2017" in q else None
                 sql = self._canonical_monthly_sql(year_filter)
                 n, df, elapsed = self._run("monthly_sales", sql)
-                if not df.empty:
-                    result.tables[n] = df
-                    result.sql_blocks.append({"name": n, "sql": sql, "source": "pre-aggregation auto-fix"})
-                    result.elapsed[n] = elapsed
-
-        if needs_state and not self._has_state_ranking_table(result.tables):
-            year_filter = "2017" if "2017" in q else None
-            sql = self._canonical_state_sql(year_filter)
-            name = "state_sales_2017" if year_filter else "state_sales"
-            n, df, elapsed = self._run(name, sql)
-            if not df.empty:
                 result.tables[n] = df
                 result.sql_blocks.append({"name": n, "sql": sql, "source": "pre-aggregation auto-fix"})
                 result.elapsed[n] = elapsed
+
+        if needs_state and not self._has_usable_state_data(result.tables, year_filter):
+            sql = self._canonical_state_sql(year_filter)
+            name = "state_sales_2017" if year_filter else "state_sales"
+            n, df, elapsed = self._run(name, sql)
+            result.tables[n] = df
+            result.sql_blocks.append({"name": n, "sql": sql, "source": "pre-aggregation auto-fix"})
+            result.elapsed[n] = elapsed
+
+    def _has_usable_monthly_data(self, tables: dict[str, pd.DataFrame]) -> bool:
+        monthly = tables.get("monthly_sales")
+        if self._is_valid_monthly_series(monthly) and not monthly.empty:
+            if self._monthly_has_positive_gmv(monthly):
+                return True
+        return False
+
+    @staticmethod
+    def _monthly_has_positive_gmv(df: pd.DataFrame) -> bool:
+        for col in df.columns:
+            if str(col).lower() in {"total_gmv", "gmv", "sales", "revenue", "total_value"}:
+                vals = pd.to_numeric(df[col], errors="coerce").fillna(0)
+                return bool((vals > 0).any())
+        return False
+
+    def _has_usable_state_data(self, tables: dict[str, pd.DataFrame], year: str | None) -> bool:
+        keys = ("state_sales_2017", "state_sales") if year else ("state_sales", "state_sales_2017")
+        for key in keys:
+            df = tables.get(key)
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            if not {"customer_state", "total_gmv"}.issubset(df.columns):
+                continue
+            vals = pd.to_numeric(df["total_gmv"], errors="coerce").fillna(0)
+            if (vals > 0).any():
+                return True
+        return False
 
     @staticmethod
     def _is_valid_monthly_series(df: pd.DataFrame | None) -> bool:
@@ -171,20 +221,20 @@ class DataAnalysisAgent:
                     return True
         return False
 
-    @staticmethod
-    def _canonical_monthly_sql(year: str | None = None) -> str:
+    def _canonical_monthly_sql(self, year: str | None = None) -> str:
+        ym = self._q("year_month")
         if year:
             return f"""
-                SELECT year_month, total_gmv, total_orders, avg_basket, total_freight
+                SELECT {ym}, total_gmv, total_orders, avg_basket, total_freight
                 FROM mv_monthly_sales
-                WHERE year_month LIKE '{year}-%'
-                ORDER BY year_month
+                WHERE {ym} LIKE '{year}-%'
+                ORDER BY {ym}
             """
-        return "SELECT year_month, total_gmv, total_orders, avg_basket, total_freight FROM mv_monthly_sales ORDER BY year_month"
+        return f"SELECT {ym}, total_gmv, total_orders, avg_basket, total_freight FROM mv_monthly_sales ORDER BY {ym}"
 
-    @staticmethod
-    def _canonical_state_sql(year: str | None = None) -> str:
-        where = f"WHERE year_month LIKE '{year}-%'" if year else ""
+    def _canonical_state_sql(self, year: str | None = None) -> str:
+        ym = self._q("year_month")
+        where = f"WHERE {ym} LIKE '{year}-%'" if year else ""
         return f"""
             SELECT customer_state,
                    ROUND(SUM(total_gmv), 2) AS total_gmv,
@@ -199,6 +249,7 @@ class DataAnalysisAgent:
 
     def _ask_llm_for_plan(self, question: str) -> dict:
         dialect = self.engine.dialect.name
+        ym_col = self._q("year_month")
         schema_text = self._schema_prompt()
         prompt = f"""
 你是 Agentic BI 系统中的 Data Analysis Agent。你的任务是把中文/英文业务问题转换为可执行 SQL。
@@ -221,13 +272,17 @@ class DataAnalysisAgent:
    - 重量运费：weight_freight
 6. intent 只能从以下选择：sales, forecast, delivery, payment, category, seller, review, weight_freight, overall, custom_sql。
 7. used_preaggregation 表示是否主要命中预聚合表。
-8. 对年份过滤，推荐使用 year_month LIKE '2017-%'；对时间戳字符串可使用 substr(order_purchase_timestamp,1,7)。
+8. 对年份过滤，推荐使用 {ym_col} LIKE '2017-%'。
+   若需从基础表 orders 按月聚合：
+   - MySQL: DATE_FORMAT(order_purchase_timestamp, '%Y-%m')
+   - SQLite: strftime('%Y-%m', order_purchase_timestamp)
 9. 品类英文名在 product_category_name_translation 表中的列名是 product_category_name_english（不是 product_category_english）。
    预聚合表 mv_category_sales 才有 product_category_english 列。JOIN 翻译表时请写：
    COALESCE(t.product_category_name_english, p.product_category_name, 'unknown') AS product_category_english
 10. 评论/差评问题：name 必须为 reviews，SQL 需包含 review_score、review_comment_title、review_comment_message、product_category_english。
 11. 若用户问「按月/趋势/月度」：monthly_sales 必须返回 year_month + total_gmv 的时间序列（多行），不要只返回一个 SUM 总数。
 12. 若用户问「各州/排名」：state_sales 或 state_sales_2017 需按 customer_state 汇总 total_gmv，可含 year_month 明细或已聚合结果。
+13. 若数据库方言为 mysql，列名 year_month 必须写成反引号形式 `year_month`（MySQL 保留字 YEAR 会导致语法错误）。
 
 可用数据字典：
 {schema_text}
@@ -311,7 +366,10 @@ class DataAnalysisAgent:
         source_l = source.lower()
         if "base" in source_l and not re.search(r"\blimit\b", s, flags=re.IGNORECASE):
             s += " LIMIT 5000"
-        return s
+        return self._adapt_sql(s)
+
+    def _preagg_order_by_month(self) -> str:
+        return f"ORDER BY {self._q('year_month')}"
 
     def _build_summary(self, result: DataResult, plan: dict) -> str:
         prefix = "LLM 已完成问题理解、表选择与 SQL 生成。"
@@ -376,8 +434,30 @@ class DataAnalysisAgent:
         return self._sales()
 
     def _run(self, name: str, sql: str, params: dict | None = None):
-        df, elapsed = timed_read_df(sql, params=params, engine=self.engine)
+        df, elapsed = timed_read_df(self._adapt_sql(sql), params=params, engine=self.engine)
         return name, df, elapsed
+
+    def _sql_monthly_all(self) -> str:
+        ym = self._q("year_month")
+        return f"SELECT * FROM mv_monthly_sales {self._preagg_order_by_month()}"
+
+    def _sql_state_2017(self) -> str:
+        ym = self._q("year_month")
+        return f"""
+            SELECT customer_state, ROUND(SUM(total_gmv), 2) AS total_gmv,
+                   SUM(total_orders) AS total_orders,
+                   SUM(unique_customers) AS unique_customers
+            FROM mv_state_sales
+            WHERE {ym} LIKE '2017-%'
+            GROUP BY customer_state
+            ORDER BY total_gmv DESC
+            LIMIT 15
+        """
+
+    def _sql_order_monthly(self, table: str, extra_order: str = "") -> str:
+        ym = self._q("year_month")
+        order = f"{ym}, {extra_order}" if extra_order else ym
+        return f"SELECT * FROM {table} ORDER BY {order}"
 
     @staticmethod
     def _is_overall(q: str) -> bool:
@@ -415,17 +495,8 @@ class DataAnalysisAgent:
     def _sales(self) -> DataResult:
         result = DataResult(intent="sales", used_preaggregation=True)
         queries = {
-            "monthly_sales": "SELECT * FROM mv_monthly_sales ORDER BY year_month",
-            "state_sales_2017": """
-                SELECT customer_state, ROUND(SUM(total_gmv), 2) AS total_gmv,
-                       SUM(total_orders) AS total_orders,
-                       SUM(unique_customers) AS unique_customers
-                FROM mv_state_sales
-                WHERE year_month LIKE '2017-%'
-                GROUP BY customer_state
-                ORDER BY total_gmv DESC
-                LIMIT 15
-            """,
+            "monthly_sales": self._sql_monthly_all(),
+            "state_sales_2017": self._sql_state_2017(),
         }
         for name, sql in queries.items():
             n, df, e = self._run(name, sql)
@@ -441,7 +512,7 @@ class DataAnalysisAgent:
 
     def _forecast_data(self) -> DataResult:
         result = DataResult(intent="forecast", used_preaggregation=True)
-        sql = "SELECT * FROM mv_monthly_sales ORDER BY year_month"
+        sql = self._sql_monthly_all()
         n, df, e = self._run("monthly_sales", sql)
         result.tables[n] = df
         result.sql_blocks.append({"name": n, "sql": sql, "source": "pre-aggregation"})
@@ -462,7 +533,7 @@ class DataAnalysisAgent:
                 GROUP BY customer_state
                 ORDER BY avg_delivery_days DESC
             """,
-            "delivery_monthly": "SELECT * FROM mv_delivery_perf ORDER BY year_month, avg_delivery_days DESC",
+            "delivery_monthly": self._sql_order_monthly("mv_delivery_perf", "avg_delivery_days DESC"),
         }
         for name, sql in queries.items():
             n, df, e = self._run(name, sql)
@@ -488,7 +559,7 @@ class DataAnalysisAgent:
                 GROUP BY payment_type
                 ORDER BY total_transactions DESC
             """,
-            "payment_monthly": "SELECT * FROM mv_payment_dist ORDER BY year_month, total_value DESC",
+            "payment_monthly": self._sql_order_monthly("mv_payment_dist", "total_value DESC"),
         }
         for name, sql in queries.items():
             n, df, e = self._run(name, sql)
@@ -515,7 +586,7 @@ class DataAnalysisAgent:
                 ORDER BY total_gmv DESC
                 LIMIT 15
             """,
-            "category_monthly": "SELECT * FROM mv_category_sales ORDER BY year_month, total_gmv DESC",
+            "category_monthly": self._sql_order_monthly("mv_category_sales", "total_gmv DESC"),
         }
         for name, sql in queries.items():
             n, df, e = self._run(name, sql)
@@ -599,7 +670,7 @@ class DataAnalysisAgent:
     def _overall(self) -> DataResult:
         result = DataResult(intent="overall", used_preaggregation=True)
         queries = {
-            "monthly_sales": "SELECT * FROM mv_monthly_sales ORDER BY year_month",
+            "monthly_sales": self._sql_monthly_all(),
             "state_sales": """
                 SELECT customer_state, ROUND(SUM(total_gmv),2) AS total_gmv, SUM(total_orders) AS total_orders
                 FROM mv_state_sales GROUP BY customer_state ORDER BY total_gmv DESC LIMIT 15

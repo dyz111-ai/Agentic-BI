@@ -2,3 +2,11 @@ python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
 streamlit run app.py
+
+# SQLite（默认，）
+DB_URL=sqlite:///data/olist.db
+
+# MySQL（需先建库、导入 CSV、刷新预聚合；与 SQLite 语句方言不同）
+CREATE DATABASE olist_agentic_bi DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+DB_URL=mysql+pymysql://root:a13761353218@localhost:3306/olist_agentic_bi
+

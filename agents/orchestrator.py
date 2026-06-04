@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+import json
 import re
 
 import pandas as pd
@@ -12,6 +13,7 @@ from agents.visualization_agent import VisualizationAgent, VisualizationResult
 from agents.nlp_agent import ReviewInsightAgent, NLPResult
 from agents.forecasting_agent import ForecastAgent, ForecastResult
 from agents.decision_agent import DecisionIntelligenceAgent, DecisionResult
+from utils.llm import LLMClient
 
 
 @dataclass
@@ -66,6 +68,7 @@ class OrchestratorAgent:
         self.nlp_agent = ReviewInsightAgent()
         self.forecast_agent = ForecastAgent()
         self.decision_agent = DecisionIntelligenceAgent()
+        self.llm = LLMClient()
         self.memory: dict[str, Any] = {}
 
     def handle(self, question: str) -> OrchestratorResult:
@@ -341,8 +344,12 @@ class OrchestratorAgent:
         visualization_result: VisualizationResult,
         orchestration_plan: dict[str, Any],
     ) -> tuple[str, list[str], list[str], list[str], dict[str, Any]]:
-        direct_answer = self._synthesize_direct_answer(question, data_result, nlp_result, forecast_result)
-        findings = self._collect_insights(question, data_result, nlp_result, forecast_result, direct_answer)
+        direct_answer, findings = self._synthesize_narrative(
+            question=question,
+            data_result=data_result,
+            nlp_result=nlp_result,
+            forecast_result=forecast_result,
+        )
         recommendations = [r.strip() for r in decision_result.recommendations if r and r.strip()]
         if not recommendations:
             recommendations = ["暂无具体建议，请结合上方分析结果与图表进一步制定运营动作。"]
@@ -367,6 +374,154 @@ class OrchestratorAgent:
             lines.append(f"- {rec}")
 
         return "\n".join(lines), direct_answer, findings, recommendations, technical_details
+
+    def _synthesize_narrative(
+        self,
+        question: str,
+        data_result: DataResult,
+        nlp_result: NLPResult | None,
+        forecast_result: ForecastResult | None,
+    ) -> tuple[list[str], list[str]]:
+        """LLM 合成直接回答与关键发现；失败或数据为空时用结构化兜底，禁止模板空话。"""
+        if self.llm.enabled:
+            try:
+                direct, findings = self._llm_synthesize_narrative(
+                    question, data_result, nlp_result, forecast_result
+                )
+                if direct or findings:
+                    return direct, findings
+            except Exception:
+                pass
+
+        direct = self._synthesize_direct_answer(question, data_result, nlp_result, forecast_result)
+        findings = self._collect_insights(question, data_result, nlp_result, forecast_result, direct_answer=direct)
+        return direct, findings
+
+    def _build_narrative_evidence(
+        self,
+        data_result: DataResult,
+        nlp_result: NLPResult | None,
+        forecast_result: ForecastResult | None,
+    ) -> dict[str, Any]:
+        evidence: dict[str, Any] = {
+            "question_intent": getattr(data_result, "intent", ""),
+            "used_preaggregation": bool(getattr(data_result, "used_preaggregation", False)),
+            "routing_method": getattr(data_result, "routing_method", ""),
+            "tables": {},
+        }
+        tables = data_result.tables or {}
+        for name, df in tables.items():
+            if isinstance(df, pd.DataFrame):
+                preview = df.head(15).copy()
+                for col in preview.columns:
+                    if pd.api.types.is_float_dtype(preview[col]):
+                        preview[col] = preview[col].round(2)
+                evidence["tables"][name] = {
+                    "row_count": int(len(df)),
+                    "columns": list(df.columns),
+                    "preview": preview.where(pd.notnull(preview), None).to_dict(orient="records"),
+                }
+        if nlp_result and getattr(nlp_result, "summary", ""):
+            evidence["nlp_summary"] = nlp_result.summary
+        if forecast_result and getattr(forecast_result, "summary", ""):
+            evidence["forecast_summary"] = forecast_result.summary
+        return evidence
+
+    def _has_usable_sales_data(self, data_result: DataResult) -> bool:
+        tables = data_result.tables or {}
+        monthly = self._find_monthly_sales_dataframe(tables)
+        if monthly is not None and not monthly.empty:
+            if pd.to_numeric(monthly["total_gmv"], errors="coerce").fillna(0).sum() > 0:
+                return True
+        state = self._get_state_ranking_df(tables)
+        if state is not None and not state.empty:
+            if pd.to_numeric(state["total_gmv"], errors="coerce").fillna(0).sum() > 0:
+                return True
+        for df in tables.values():
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            for col in df.columns:
+                if str(col).lower() in {"total_gmv", "gmv", "sales", "revenue", "total_value", "payment_value"}:
+                    if pd.to_numeric(df[col], errors="coerce").fillna(0).sum() > 0:
+                        return True
+        return False
+
+    def _empty_data_direct_answer(self, question: str, data_result: DataResult) -> list[str]:
+        q = question.lower()
+        asks_sales = any(k in q for k in ["gmv", "销售", "营收", "2017", "趋势", "州", "排名"])
+        if asks_sales:
+            return [
+                "本次查询未返回有效的 GMV 或销售明细数据。",
+                "请确认：① MySQL 是否已导入 Olist 订单 CSV；② 侧边栏是否已点击「刷新预聚合表」；③ 数据库连接是否指向含数据的环境。",
+            ]
+        if getattr(data_result, "llm_error", ""):
+            return [f"数据查询未完成：{data_result.llm_error[:200]}"]
+        return ["本次查询未返回可用数据，请检查数据库连接与预聚合表是否已刷新。"]
+
+    def _llm_synthesize_narrative(
+        self,
+        question: str,
+        data_result: DataResult,
+        nlp_result: NLPResult | None,
+        forecast_result: ForecastResult | None,
+    ) -> tuple[list[str], list[str]]:
+        evidence = self._build_narrative_evidence(data_result, nlp_result, forecast_result)
+        has_data = self._has_usable_sales_data(data_result)
+
+        if not has_data:
+            return self._empty_data_direct_answer(question, data_result), []
+
+        evidence_text = json.dumps(evidence, ensure_ascii=False, default=str, indent=2)
+        prompt = f"""
+用户问题：{question}
+
+以下是系统真实查询得到的结构化数据（仅供你分析，不要在回答中出现 JSON、evidence、字段名等技术词汇）：
+
+{evidence_text}
+
+请输出严格 JSON，格式如下：
+{{
+  "direct_answer": ["用 1-3 条完整中文句子直接回答用户问题，必须引用上面的真实数字"],
+  "findings": ["用 1-4 条完整中文句子写出关键发现，必须基于真实数据，禁止空泛套话"]
+}}
+
+硬性规则：
+1. 必须引用查询结果中的具体数字（GMV、州名、月份、评分等）。
+2. 禁止输出「已根据查询结果生成图表」「建议结合图表继续分析」等空话。
+3. 禁止出现 evidence_json、JSON、SQL、预聚合表名、ETL 等内部术语。
+4. 若某指标在数据中不存在或为空，明确写「当前查询未返回该指标」，不要编造。
+5. 只返回 JSON，不要 Markdown。
+"""
+        content = self.llm.chat(
+            [
+                {"role": "system", "content": "你是电商 BI 分析助手。只返回合法 JSON。"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+            max_tokens=1200,
+        )
+        parsed = LLMClient.extract_json(content)
+        direct = [str(x).strip() for x in (parsed.get("direct_answer") or []) if str(x).strip()]
+        findings = [str(x).strip() for x in (parsed.get("findings") or []) if str(x).strip()]
+        direct = self._filter_boilerplate(direct)
+        findings = self._filter_boilerplate(findings)
+        return self._dedupe_lines(direct)[:4], self._dedupe_lines(findings)[:5]
+
+    BOILERPLATE_PHRASES = (
+        "已根据查询结果生成图表",
+        "请结合下方明细查看",
+        "建议结合图表继续",
+        "当前结果以描述性统计为主",
+        "evidence_json",
+    )
+
+    def _filter_boilerplate(self, lines: list[str]) -> list[str]:
+        out: list[str] = []
+        for line in lines:
+            if any(p in line for p in self.BOILERPLATE_PHRASES):
+                continue
+            out.append(line)
+        return out
 
     def _synthesize_direct_answer(
         self,
@@ -441,8 +596,11 @@ class OrchestratorAgent:
             lines.append(forecast_result.summary.strip())
 
         if not lines:
-            fallback = self._fallback_direct_from_summary(data_result.summary)
-            lines = fallback if fallback else ["已根据查询结果生成图表与数据表，请结合下方明细查看。"]
+            if not self._has_usable_sales_data(data_result):
+                lines = self._empty_data_direct_answer(question, data_result)
+            else:
+                fallback = self._fallback_direct_from_summary(data_result.summary)
+                lines = fallback if fallback else []
         return self._dedupe_lines(lines)[:6]
 
     def _collect_insights(
@@ -499,7 +657,9 @@ class OrchestratorAgent:
             insights.append(forecast_result.summary)
 
         if not insights:
-            insights.append("当前结果以描述性统计为主，建议结合图表继续按区域、品类或时间维度做对比分析。")
+            if not self._has_usable_sales_data(data_result):
+                return []
+            insights.append("可从区域、品类、时间三个维度对比核心 KPI，识别增长或风险点。")
         return self._dedupe_lines(insights)[:5]
 
     def _get_state_ranking_df(self, tables: dict[str, pd.DataFrame]) -> pd.DataFrame | None:

@@ -77,8 +77,10 @@ class VisualizationAgent:
         # 3) NLP-specific visualizations.
         self._add_nlp_charts(res, nlp_result)
 
-        # 4) Forecast overlay if no monthly figure was created.
-        if forecast_result is not None and "GMV 趋势与预测" not in "|".join(res.figures.keys()):
+        # 4) Forecast overlay only when no monthly GMV trend chart was created above.
+        monthly_trend_titles = ("月度 GMV 趋势", "GMV 趋势与预测")
+        has_monthly_trend = any(k in res.figures for k in monthly_trend_titles)
+        if forecast_result is not None and not has_monthly_trend:
             monthly = self._find_monthly_like_table(tables)
             if monthly is not None and len(res.figures) < self.MAX_AUTO_FIGURES:
                 res.figures["GMV 趋势与预测"] = self._monthly_sales_fig(monthly, forecast_result)
@@ -273,10 +275,31 @@ class VisualizationAgent:
         fig.add_trace(go.Scatter(x=df["date"], y=df["total_gmv"], mode="lines+markers", name="历史 GMV"))
         if forecast_result is not None and not getattr(forecast_result, "forecast_df", pd.DataFrame()).empty:
             fc = forecast_result.forecast_df
-            fig.add_trace(go.Scatter(x=fc["date"], y=fc["forecast_gmv"], mode="lines+markers", name="未来 6 周预测"))
-            if {"upper", "lower"}.issubset(fc.columns):
-                fig.add_trace(go.Scatter(x=fc["date"], y=fc["upper"], mode="lines", name="置信区间上界", line=dict(width=0), showlegend=False))
-                fig.add_trace(go.Scatter(x=fc["date"], y=fc["lower"], mode="lines", name="置信区间", fill="tonexty", line=dict(width=0)))
+            date_col = "ds" if "ds" in fc.columns else "date"
+            y_col = "yhat" if "yhat" in fc.columns else "forecast_gmv"
+            lower_col = "yhat_lower" if "yhat_lower" in fc.columns else "lower"
+            upper_col = "yhat_upper" if "yhat_upper" in fc.columns else "upper"
+            fig.add_trace(
+                go.Scatter(
+                    x=fc[date_col], y=fc[y_col],
+                    mode="lines+markers", name="未来 6 周预测（Prophet）",
+                )
+            )
+            if {upper_col, lower_col}.issubset(fc.columns):
+                fig.add_trace(
+                    go.Scatter(
+                        x=fc[date_col], y=fc[upper_col],
+                        mode="lines", name="95% 置信区间上界",
+                        line=dict(width=0), showlegend=False,
+                    )
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=fc[date_col], y=fc[lower_col],
+                        mode="lines", name="95% 置信区间",
+                        fill="tonexty", line=dict(width=0),
+                    )
+                )
         fig.update_layout(title="月度 GMV 趋势与预测", xaxis_title="日期", yaxis_title="GMV")
         return fig
 

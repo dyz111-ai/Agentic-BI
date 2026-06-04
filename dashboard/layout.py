@@ -151,9 +151,9 @@ def render_figures(figures: dict):
     if not figures:
         st.info("本次问题没有生成图表。")
         return
-    for name, fig in figures.items():
+    for idx, (name, fig) in enumerate(figures.items()):
         st.markdown(f"**{name}**")
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, width="stretch", key=f"plotly_chart_{idx}_{name}")
 
 
 def render_metrics(elapsed: dict):
