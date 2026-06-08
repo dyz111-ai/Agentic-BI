@@ -51,33 +51,29 @@ class VisualizationAgent:
         nlp_result: Any = None,
         forecast_result: Any = None,
         question: str | None = None,
+        chart_plan: list[dict] | None = None,
     ) -> VisualizationResult:
         res = VisualizationResult()
         tables = getattr(data_result, "tables", {}) or {}
-        used_tables: set[str] = set()
 
-        # 1) Keep task-specific charts when known table names exist.
-        self._add_known_charts(res, tables, nlp_result, forecast_result, used_tables)
-
-        # 2) Add dynamic charts for unknown/custom LLM query results.
-        for table_name, df in tables.items():
-            if len(res.figures) >= self.MAX_AUTO_FIGURES:
-                break
-            if not isinstance(df, pd.DataFrame) or df.empty:
-                continue
-            # If a known chart already covers the table, skip generic duplicate unless no figures were generated at all.
-            if table_name in used_tables and len(res.figures) > 0:
-                continue
-            for title, fig in self._infer_figures_from_dataframe(table_name, df, question=question):
+        if chart_plan:
+            self._execute_chart_plan(chart_plan, tables, res)
+        else:
+            used_tables: set[str] = set()
+            self._add_known_charts(res, tables, nlp_result, forecast_result, used_tables)
+            for table_name, df in tables.items():
                 if len(res.figures) >= self.MAX_AUTO_FIGURES:
                     break
-                if title not in res.figures:
-                    res.figures[title] = fig
+                if table_name in used_tables and len(res.figures) > 0:
+                    continue
+                for title, fig in self._infer_figures_from_dataframe(table_name, df, question=question):
+                    if len(res.figures) >= self.MAX_AUTO_FIGURES:
+                        break
+                    if title not in res.figures:
+                        res.figures[title] = fig
 
-        # 3) NLP-specific visualizations.
         self._add_nlp_charts(res, nlp_result)
 
-        # 4) Forecast overlay only when no monthly GMV trend chart was created above.
         monthly_trend_titles = ("月度 GMV 趋势", "GMV 趋势与预测")
         has_monthly_trend = any(k in res.figures for k in monthly_trend_titles)
         if forecast_result is not None and not has_monthly_trend:
@@ -147,6 +143,118 @@ class VisualizationAgent:
                     kwargs["size"] = df[size_col].clip(lower=1, upper=df[size_col].quantile(0.95))
                 res.figures["商品重量 vs 运费"] = px.scatter(df, x="product_weight_g", y="freight_value", title="商品重量与运费关系", **kwargs)
                 used_tables.add("weight_freight")
+
+    # ------------------------------------------------------------------
+    # LLM chart plan execution
+    # ------------------------------------------------------------------
+
+    def _execute_chart_plan(self, chart_plan: list[dict], tables: dict[str, pd.DataFrame], res: VisualizationResult) -> None:
+        for chart in chart_plan:
+            if len(res.figures) >= self.MAX_AUTO_FIGURES:
+                break
+            chart_type = chart.get("type", "")
+            title = chart.get("title", "")
+            table_name = chart.get("table", "")
+            if not title or not table_name:
+                continue
+
+            df = tables.get(table_name)
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+
+            fig = None
+            try:
+                if chart_type == "line":
+                    fig = self._exec_line(chart, df)
+                elif chart_type == "bar":
+                    fig = self._exec_bar(chart, df)
+                elif chart_type == "pie":
+                    fig = self._exec_pie(chart, df)
+                elif chart_type == "scatter":
+                    fig = self._exec_scatter(chart, df)
+                elif chart_type == "map":
+                    fig = self._exec_map(chart, df)
+                elif chart_type == "heatmap":
+                    fig = self._exec_heatmap(chart, df)
+            except Exception:
+                continue
+
+            if fig is not None and title not in res.figures:
+                res.figures[title] = fig
+
+    def _exec_line(self, chart: dict, df: pd.DataFrame):
+        title = chart.get("title", "时间趋势")
+        x = chart.get("x") or self._find_time_col(df)
+        y = chart.get("y") or self._find_metric_col(df)
+        if not x or not y:
+            return None
+        ts = self._prepare_time_series(df, x, y)
+        if ts.empty:
+            return None
+        return px.line(ts, x="date", y=y, markers=True, title=title)
+
+    def _exec_bar(self, chart: dict, df: pd.DataFrame):
+        title = chart.get("title", "柱状图")
+        x = chart.get("x") or self._find_col(df, ["customer_state", "product_category_english", "payment_type", "seller_id"])
+        y = chart.get("y") or self._find_metric_col(df)
+        orientation = chart.get("orientation", "v")
+        if not x or not y:
+            return None
+        agg = df.groupby(x, as_index=False)[y].sum().sort_values(y, ascending=False).head(20)
+        if orientation == "h":
+            return px.bar(agg, x=y, y=x, orientation="h", title=title)
+        return px.bar(agg, x=x, y=y, title=title)
+
+    def _exec_pie(self, chart: dict, df: pd.DataFrame):
+        title = chart.get("title", "饼图")
+        names = chart.get("x") or self._find_col(df, ["payment_type", "product_category_english", "customer_state"])
+        values = chart.get("y") or self._find_metric_col(df)
+        if not names or not values:
+            return None
+        agg = df.groupby(names, as_index=False)[values].sum().sort_values(values, ascending=False).head(10)
+        return px.pie(agg, names=names, values=values, title=title)
+
+    def _exec_scatter(self, chart: dict, df: pd.DataFrame):
+        title = chart.get("title", "散点图")
+        x = chart.get("x") or self._find_metric_col(df)
+        y = chart.get("y") or (self._find_metric_col(df, prefer=["freight_value", "total_gmv", "avg_delivery_days", "on_time_rate", "price", "total_value"]) or self._find_metric_col(df))
+        if not x or not y:
+            return None
+        color_col = self._find_col(df, ["delivery_status", "customer_state", "payment_type", "product_category_english"])
+        sample = df[[x, y] + ([color_col] if color_col else [])].dropna().head(5000)
+        kwargs = {"color": color_col} if color_col else {}
+        return px.scatter(sample, x=x, y=y, title=title, **kwargs)
+
+    def _exec_map(self, chart: dict, df: pd.DataFrame):
+        title = chart.get("title", "地理分布")
+        state_col = self._find_col(df, ["customer_state", "seller_state", "state"])
+        value_col = chart.get("y") or self._find_metric_col(df)
+        if not state_col:
+            return None
+        work = df.copy()
+        work = work.rename(columns={state_col: "customer_state"})
+        if value_col and value_col != "customer_state":
+            work = work.rename(columns={value_col: "total_gmv"})
+        if "total_gmv" not in work.columns:
+            numeric = [c for c in work.select_dtypes(include="number").columns if c != "customer_state"]
+            if numeric:
+                work = work.rename(columns={numeric[0]: "total_gmv"})
+        if "total_orders" not in work.columns:
+            work["total_orders"] = 1
+        return self._state_map_fig(work)
+
+    def _exec_heatmap(self, chart: dict, df: pd.DataFrame):
+        title = chart.get("title", "热力图")
+        x = chart.get("x")
+        y = chart.get("y")
+        z = chart.get("z") or self._find_metric_col(df)
+        if not x:
+            cats = [c for c in df.columns if c not in {str(chart.get("y")), str(chart.get("z"))} and df[c].nunique(dropna=True) <= 40]
+            if len(cats) >= 2:
+                x, y = cats[0], cats[1]
+        if not x or not y or not z:
+            return None
+        return self._heatmap(df, index=x, columns=y, values=z, title=title)
 
     def _add_nlp_charts(self, res: VisualizationResult, nlp_result: Any) -> None:
         if nlp_result is not None and getattr(nlp_result, "top_negative_categories", pd.DataFrame()).empty is False:

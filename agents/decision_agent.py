@@ -46,8 +46,9 @@ class DecisionIntelligenceAgent:
         data_result: Any,
         nlp_result: Any = None,
         forecast_result: Any = None,
+        what_if_result: Any = None,
     ) -> DecisionResult:
-        evidence = self._build_evidence_packet(data_result, nlp_result, forecast_result)
+        evidence = self._build_evidence_packet(data_result, nlp_result, forecast_result, what_if_result)
         local_summary = self._local_summary_from_evidence(evidence)
 
         if self.llm.enabled:
@@ -158,7 +159,7 @@ class DecisionIntelligenceAgent:
     # Evidence packet
     # ------------------------------------------------------------------
 
-    def _build_evidence_packet(self, data_result: Any, nlp_result: Any, forecast_result: Any) -> dict[str, Any]:
+    def _build_evidence_packet(self, data_result: Any, nlp_result: Any, forecast_result: Any, what_if_result: Any = None) -> dict[str, Any]:
         packet: dict[str, Any] = {
             "data_summary": getattr(data_result, "summary", ""),
             "intent": getattr(data_result, "intent", ""),
@@ -167,6 +168,7 @@ class DecisionIntelligenceAgent:
             "tables": {},
             "nlp": {},
             "forecast": {},
+            "what_if": {},
         }
 
         tables = getattr(data_result, "tables", {}) or {}
@@ -179,6 +181,9 @@ class DecisionIntelligenceAgent:
 
         if forecast_result is not None:
             packet["forecast"] = self._forecast_evidence(forecast_result)
+
+        if what_if_result is not None and getattr(what_if_result, "has_result", False):
+            packet["what_if"] = self._what_if_evidence(what_if_result)
 
         return packet
 
@@ -205,6 +210,19 @@ class DecisionIntelligenceAgent:
         if isinstance(fc, pd.DataFrame) and not fc.empty:
             out["forecast_rows"] = self._df_preview(fc, max_rows=8)
         return out
+
+    def _what_if_evidence(self, what_if_result: Any) -> dict[str, Any]:
+        return {
+            "scenario": getattr(what_if_result, "scenario", ""),
+            "current_avg_score": getattr(what_if_result, "current_avg_score", 0),
+            "projected_avg_score": getattr(what_if_result, "projected_avg_score", 0),
+            "score_improvement": getattr(what_if_result, "score_improvement", 0),
+            "score_improvement_pct": getattr(what_if_result, "score_improvement_pct", 0),
+            "removed_seller_count": getattr(what_if_result, "removed_seller_count", 0),
+            "removed_order_count": getattr(what_if_result, "removed_order_count", 0),
+            "total_order_count": getattr(what_if_result, "total_order_count", 0),
+            "summary": getattr(what_if_result, "summary", ""),
+        }
 
     @staticmethod
     def _df_preview(df: pd.DataFrame, max_rows: int = 10) -> list[dict[str, Any]]:
@@ -337,6 +355,16 @@ class DecisionIntelligenceAgent:
         fc_summary = forecast.get("summary")
         if fc_summary:
             recs.append(f"预测结果显示：{fc_summary} 建议提前规划广告预算、库存补货和物流资源，避免需求变化造成缺货或配送延迟。")
+
+        # What-If simulation.
+        what_if = evidence.get("what_if") or {}
+        if what_if.get("current_avg_score"):
+            recs.append(
+                f"What-If 模拟：当前平台加权评分为 {what_if['current_avg_score']:.4f}，"
+                f"移除评分最低的 {what_if.get('removed_seller_count', 0)} 个卖家后预计提升至 "
+                f"{what_if['projected_avg_score']:.4f}（+{what_if.get('score_improvement_pct', 0):.2f}%）。"
+                f"建议先执行分阶段观察（警告 → 限流 → 整改 → 下架），各阶段设置评分/订单数门槛与观察时限。"
+            )
 
         if not recs:
             if not tables:

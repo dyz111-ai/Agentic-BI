@@ -28,6 +28,77 @@ def render_recommendations(recommendations: list[str]):
         st.markdown(f"- {rec}")
 
 
+def render_what_if(what_if_result):
+    if what_if_result is None or not getattr(what_if_result, "has_result", False):
+        return
+
+    st.markdown("---")
+    st.markdown("#### 🔮 What-If 模拟分析")
+    st.markdown(f"**模拟场景：** {getattr(what_if_result, 'scenario', '')}")
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("当前加权平均评分", f"{getattr(what_if_result, 'current_avg_score', 0):.4f}")
+    col2.metric("模拟后评分", f"{getattr(what_if_result, 'projected_avg_score', 0):.4f}")
+    improvement = getattr(what_if_result, "score_improvement", 0)
+    improvement_pct = getattr(what_if_result, "score_improvement_pct", 0)
+    col3.metric("评分提升", f"{improvement:+.4f}", delta=f"{improvement_pct:+.1f}%")
+    col4.metric("移除卖家数 / 订单数", f"{getattr(what_if_result, 'removed_seller_count', 0)} 家 / {getattr(what_if_result, 'removed_order_count', 0):,} 单")
+
+    summary = getattr(what_if_result, "summary", "")
+    if summary:
+        with st.expander("模拟详情", expanded=True):
+            st.markdown(summary)
+
+
+def render_anomaly(anomaly_result):
+    if anomaly_result is None or not getattr(anomaly_result, "has_alerts", False):
+        return
+
+    st.markdown("---")
+    st.markdown("#### 🔍 异常检测与预警")
+
+    alert_count = getattr(anomaly_result, "alert_count", 0)
+    critical = getattr(anomaly_result, "critical_count", 0)
+    warning = getattr(anomaly_result, "warning_count", 0)
+    info = getattr(anomaly_result, "info_count", 0)
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("总预警数", alert_count)
+    col2.metric("🚨 严重", critical, delta_color="inverse")
+    col3.metric("⚠️ 警告", warning, delta_color="inverse")
+    col4.metric("ℹ️ 提示", info)
+
+    scan_dims = getattr(anomaly_result, "scan_dimensions", [])
+    scan_period = getattr(anomaly_result, "scan_period", "")
+    if scan_dims:
+        st.caption(f"扫描维度：{'、'.join(scan_dims)}　|　扫描窗口：{scan_period} vs 历史基线")
+
+    alerts = getattr(anomaly_result, "alerts", []) or []
+    if alerts:
+        with st.expander("预警详情", expanded=True):
+            rows = []
+            for a in alerts:
+                sev_icon = {"critical": "🚨", "warning": "⚠️", "info": "ℹ️"}.get(a.severity, "—")
+                rows.append({
+                    "等级": sev_icon,
+                    "维度": a.dimension,
+                    "主体": a.entity,
+                    "指标": a.metric,
+                    "当前值": f"{a.current_value:,.2f}" if isinstance(a.current_value, float) and abs(a.current_value) > 1 else f"{a.current_value:.4f}",
+                    "基线值": f"{a.baseline_value:,.2f}" if isinstance(a.baseline_value, float) and abs(a.baseline_value) > 1 else f"{a.baseline_value:.4f}",
+                    "变化": f"{a.change_pct:+.1f}%",
+                    "说明": a.description,
+                    "建议": a.suggestion,
+                })
+            st.dataframe(rows, use_container_width=True, hide_index=True,
+                         column_order=["等级", "维度", "主体", "指标", "当前值", "基线值", "变化", "说明", "建议"])
+
+    summary = getattr(anomaly_result, "summary", "")
+    if summary:
+        with st.expander("LLM 业务解读", expanded=False):
+            st.markdown(summary)
+
+
 def render_technical_details(details: dict):
     if not details:
         return
@@ -37,6 +108,7 @@ def render_technical_details(details: dict):
         c2.metric("数据来源", details.get("data_source", "—"))
         c3.metric("图表数量", details.get("chart_count", 0))
 
+        st.caption(f"图表策略：{details.get('chart_mode', '—')}")
         st.caption(f"分析意图：{details.get('intent', '—')}")
         if details.get("orchestrator"):
             st.caption(f"编排框架：{details.get('orchestrator')} · 会话轮次：{details.get('conversation_turns', '—')}")
@@ -74,6 +146,8 @@ def render_report(result):
         st.markdown("#### 决策建议")
         recommendations = getattr(result, "recommendations", None) or getattr(result.decision_result, "recommendations", None) or []
         render_recommendations(recommendations)
+        render_what_if(getattr(result, "what_if_result", None))
+        render_anomaly(getattr(result, "anomaly_result", None))
         render_technical_details(getattr(result, "technical_details", {}) or {})
         render_metrics(getattr(result.data_result, "elapsed", {}) or {})
 

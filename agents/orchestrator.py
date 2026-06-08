@@ -13,6 +13,8 @@ from agents.visualization_agent import VisualizationAgent, VisualizationResult
 from agents.nlp_agent import ReviewInsightAgent, NLPResult
 from agents.forecasting_agent import ForecastAgent, ForecastResult
 from agents.decision_agent import DecisionIntelligenceAgent, DecisionResult
+from agents.what_if_agent import WhatIfAgent, WhatIfResult
+from agents.anomaly_agent import AnomalyDetectionAgent, AnomalyResult
 from utils.llm import LLMClient
 
 
@@ -24,6 +26,8 @@ class OrchestratorResult:
     decision_result: DecisionResult
     nlp_result: NLPResult | None = None
     forecast_result: ForecastResult | None = None
+    what_if_result: WhatIfResult | None = None
+    anomaly_result: AnomalyResult | None = None
     final_answer: str = ""
     direct_answer: list[str] = field(default_factory=list)
     findings: list[str] = field(default_factory=list)
@@ -54,6 +58,17 @@ class OrchestratorAgent:
         "6周", "六周", "趋势预测", "sales forecast"
     )
 
+    WHAT_IF_HINTS = (
+        "如果", "假设", "下架", "模拟", "what-if", "what if",
+        "情景", "scenario", "假如下架", "移除", "会怎样", "提升多少",
+    )
+
+    ANOMALY_HINTS = (
+        "异常", "骤降", "突升", "预警", "报警", "anomaly",
+        "突然下降", "大幅下降", "突然上升", "最近怎么了", "有什么问题",
+        "检查", "监控", "告警", "alert",
+    )
+
     REVIEW_COLUMNS = {
         "review_score", "review_comment_title", "review_comment_message",
         "review_creation_date", "review_answer_timestamp", "sentiment_label"
@@ -68,6 +83,8 @@ class OrchestratorAgent:
         self.nlp_agent = ReviewInsightAgent()
         self.forecast_agent = ForecastAgent()
         self.decision_agent = DecisionIntelligenceAgent()
+        self.what_if_agent = WhatIfAgent(engine)
+        self.anomaly_agent = AnomalyDetectionAgent(engine)
         self.llm = LLMClient()
         self.memory: dict[str, Any] = {}
 
@@ -92,13 +109,43 @@ class OrchestratorAgent:
             else:
                 plan["notes"].append("已判断需要预测分析，但没有找到包含 year_month/date 与 GMV/sales 的历史序列表，因此跳过 Forecast Agent。")
 
+        what_if_result = None
+        if plan["needs_what_if"]:
+            seller_df = self._find_seller_dataframe(data_result.tables)
+            what_if_result = self.what_if_agent.simulate_remove_low_score_sellers(
+                seller_data=seller_df,
+                question=question,
+                nlp_result=nlp_result,
+            )
+            if what_if_result.has_result:
+                plan["notes"].append(
+                    f"What-If 模拟：移除评分最低 {what_if_result.removed_seller_count} 个卖家，"
+                    f"预计评分从 {what_if_result.current_avg_score:.4f} 提升至 {what_if_result.projected_avg_score:.4f}。"
+                )
+            else:
+                plan["notes"].append(f"What-If 模拟未能执行：{what_if_result.summary[:100]}")
+
+        anomaly_result = None
+        if plan["needs_anomaly"]:
+            anomaly_result = self.anomaly_agent.scan(question=question)
+            if anomaly_result.has_alerts:
+                plan["notes"].append(
+                    f"异常扫描：发现 {anomaly_result.alert_count} 条异常（"
+                    f"🚨{anomaly_result.critical_count} ⚠️{anomaly_result.warning_count} ℹ️{anomaly_result.info_count}）"
+                )
+            else:
+                plan["notes"].append("异常扫描已完成，未检测到显著异常。")
+
         visualization_result = self.viz_agent.visualize(
             data_result=data_result,
             nlp_result=nlp_result,
             forecast_result=forecast_result,
             question=question,
+            chart_plan=getattr(data_result, "chart_plan", None) or None,
         )
-        decision_result = self.decision_agent.generate(question, data_result, nlp_result, forecast_result)
+        decision_result = self.decision_agent.generate(
+            question, data_result, nlp_result, forecast_result, what_if_result
+        )
 
         final_answer, direct_answer, findings, recommendations, technical_details = self._compose_answer(
             question=question,
@@ -106,6 +153,8 @@ class OrchestratorAgent:
             decision_result=decision_result,
             nlp_result=nlp_result,
             forecast_result=forecast_result,
+            what_if_result=what_if_result,
+            anomaly_result=anomaly_result,
             visualization_result=visualization_result,
             orchestration_plan=plan,
         )
@@ -122,6 +171,8 @@ class OrchestratorAgent:
             decision_result=decision_result,
             nlp_result=nlp_result,
             forecast_result=forecast_result,
+            what_if_result=what_if_result,
+            anomaly_result=anomaly_result,
             final_answer=final_answer,
             direct_answer=direct_answer,
             findings=findings,
@@ -160,6 +211,22 @@ class OrchestratorAgent:
         needs_review = bool(review_by_plan or review_by_question or review_by_data or review_by_intent_fallback)
         needs_forecast = bool(forecast_by_plan or forecast_by_question or forecast_by_intent_fallback)
 
+        what_if_by_plan = self._truthy_any(data_plan, [
+            "needs_what_if", "requires_what_if", "needs_simulation", "requires_simulation",
+        ]) or any(a in required_agents for a in {"what_if", "whatif", "simulation", "whatifagent"})
+        what_if_by_question = any(h.lower() in q for h in self.WHAT_IF_HINTS)
+        what_if_by_data = self._find_seller_dataframe(data_result.tables) is not None
+        what_if_by_intent_fallback = getattr(data_result, "intent", "") in {"seller", "overall"}
+        needs_what_if = bool(what_if_by_plan or what_if_by_question or what_if_by_intent_fallback)
+
+        anomaly_by_plan = self._truthy_any(data_plan, [
+            "needs_anomaly", "requires_anomaly", "needs_alert", "requires_alert",
+            "needs_monitoring", "requires_monitoring",
+        ]) or any(a in required_agents for a in {"anomaly", "alert", "monitoring", "anomalydetectionagent"})
+        anomaly_by_question = any(h.lower() in q for h in self.ANOMALY_HINTS)
+        anomaly_by_intent_fallback = getattr(data_result, "intent", "") in {"overall"}
+        needs_anomaly = bool(anomaly_by_plan or anomaly_by_question or anomaly_by_intent_fallback)
+
         # overall 问题通常需要多维综合；如果 DataAgent 已返回历史销售序列，也允许补充预测。
         if getattr(data_result, "intent", "") == "overall" and forecast_by_data:
             needs_forecast = True
@@ -168,6 +235,8 @@ class OrchestratorAgent:
             "required_agents_from_data_plan": sorted(required_agents),
             "needs_review_analysis": needs_review,
             "needs_forecast": needs_forecast,
+            "needs_what_if": needs_what_if,
+            "needs_anomaly": needs_anomaly,
             "needs_visualization": True,
             "needs_decision": True,
             "review_reason": self._reason_flags(
@@ -175,6 +244,12 @@ class OrchestratorAgent:
             ),
             "forecast_reason": self._reason_flags(
                 plan=forecast_by_plan, question=forecast_by_question, data=forecast_by_data, intent=forecast_by_intent_fallback
+            ),
+            "what_if_reason": self._reason_flags(
+                plan=what_if_by_plan, question=what_if_by_question, data=what_if_by_data, intent=what_if_by_intent_fallback
+            ),
+            "anomaly_reason": self._reason_flags(
+                plan=anomaly_by_plan, question=anomaly_by_question, intent=anomaly_by_intent_fallback
             ),
             "returned_tables": list(data_result.tables.keys()),
             "returned_schema": table_schema,
@@ -265,6 +340,32 @@ class OrchestratorAgent:
                 best = (score, name, norm)
         return best[2] if best else None
 
+    def _find_seller_dataframe(self, tables: dict[str, pd.DataFrame]) -> pd.DataFrame | None:
+        if "low_score_sellers" in tables and isinstance(tables["low_score_sellers"], pd.DataFrame):
+            return tables["low_score_sellers"]
+        if "seller_perf" in tables and isinstance(tables["seller_perf"], pd.DataFrame):
+            return tables["seller_perf"]
+        candidates: list[tuple[int, str, pd.DataFrame]] = []
+        for name, df in tables.items():
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            cols = {str(c).lower() for c in df.columns}
+            score = 0
+            if "avg_review_score" in cols:
+                score += 3
+            if "seller_id" in cols:
+                score += 2
+            if "total_orders" in cols:
+                score += 2
+            if any("seller" in c or "score" in c for c in cols):
+                score += 1
+            if score > 0:
+                candidates.append((score, name, df))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][2]
+
     def _normalize_monthly_sales(self, df: pd.DataFrame) -> pd.DataFrame | None:
         """Return df with year_month and total_gmv columns for ForecastAgent."""
         if df is None or df.empty:
@@ -341,6 +442,8 @@ class OrchestratorAgent:
         decision_result: DecisionResult,
         nlp_result: NLPResult | None,
         forecast_result: ForecastResult | None,
+        what_if_result: WhatIfResult | None,
+        anomaly_result: AnomalyResult | None,
         visualization_result: VisualizationResult,
         orchestration_plan: dict[str, Any],
     ) -> tuple[str, list[str], list[str], list[str], dict[str, Any]]:
@@ -358,6 +461,8 @@ class OrchestratorAgent:
             data_result=data_result,
             nlp_result=nlp_result,
             forecast_result=forecast_result,
+            what_if_result=what_if_result,
+            anomaly_result=anomaly_result,
             visualization_result=visualization_result,
             orchestration_plan=orchestration_plan,
         )
@@ -372,6 +477,16 @@ class OrchestratorAgent:
         lines.append("\n### 决策建议")
         for rec in recommendations:
             lines.append(f"- {rec}")
+
+        if what_if_result is not None and what_if_result.has_result:
+            lines.append("\n### What-If 模拟分析")
+            lines.append(what_if_result.summary)
+            if what_if_result.llm_analysis:
+                lines.append(what_if_result.llm_analysis)
+
+        if anomaly_result is not None and anomaly_result.has_alerts:
+            lines.append("\n### 异常预警")
+            lines.append(anomaly_result.summary)
 
         return "\n".join(lines), direct_answer, findings, recommendations, technical_details
 
@@ -680,6 +795,8 @@ class OrchestratorAgent:
         data_result: DataResult,
         nlp_result: NLPResult | None,
         forecast_result: ForecastResult | None,
+        what_if_result: WhatIfResult | None,
+        anomaly_result: AnomalyResult | None,
         visualization_result: VisualizationResult,
         orchestration_plan: dict[str, Any],
     ) -> dict[str, Any]:
@@ -696,11 +813,14 @@ class OrchestratorAgent:
             "data_source": "预聚合表 mv_*" if data_result.used_preaggregation else "基础表 / 自定义 SQL",
             "intent": getattr(data_result, "intent", ""),
             "chart_count": len(visualization_result.figures),
+            "chart_mode": "LLM 图表规划" if (getattr(data_result, "chart_plan", None) or None) else "规则推断",
             "llm_error": getattr(data_result, "llm_error", "") or "",
             "returned_tables": orchestration_plan.get("returned_tables", []),
             "agents": {
                 "评论洞察": {"called": nlp_result is not None, "reason": self._humanize_reasons(orchestration_plan.get("review_reason", []))},
                 "销售预测": {"called": forecast_result is not None, "reason": self._humanize_reasons(orchestration_plan.get("forecast_reason", []))},
+                "What-If 模拟": {"called": what_if_result is not None and what_if_result.has_result, "reason": self._humanize_reasons(orchestration_plan.get("what_if_reason", []))},
+                "异常检测": {"called": anomaly_result is not None and anomaly_result.has_alerts, "reason": self._humanize_reasons(orchestration_plan.get("anomaly_reason", []))},
                 "可视化": {"called": True, "reason": "按返回数据自动选图"},
                 "决策智能": {"called": True, "reason": "综合各 Agent 输出"},
             },
