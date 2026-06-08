@@ -55,18 +55,19 @@ class VisualizationAgent:
     ) -> VisualizationResult:
         res = VisualizationResult()
         tables = getattr(data_result, "tables", {}) or {}
+        intent = getattr(data_result, "intent", "overall") or "overall"
 
         if chart_plan:
-            self._execute_chart_plan(chart_plan, tables, res)
+            self._execute_chart_plan(chart_plan, tables, res, intent)
         else:
             used_tables: set[str] = set()
-            self._add_known_charts(res, tables, nlp_result, forecast_result, used_tables)
+            self._add_known_charts(res, tables, nlp_result, forecast_result, used_tables, intent)
             for table_name, df in tables.items():
                 if len(res.figures) >= self.MAX_AUTO_FIGURES:
                     break
-                if table_name in used_tables and len(res.figures) > 0:
+                if table_name in used_tables:
                     continue
-                for title, fig in self._infer_figures_from_dataframe(table_name, df, question=question):
+                for title, fig in self._infer_figures_from_dataframe(table_name, df, question=question, intent=intent):
                     if len(res.figures) >= self.MAX_AUTO_FIGURES:
                         break
                     if title not in res.figures:
@@ -77,7 +78,7 @@ class VisualizationAgent:
         monthly_trend_titles = ("月度 GMV 趋势", "GMV 趋势与预测")
         has_monthly_trend = any(k in res.figures for k in monthly_trend_titles)
         if forecast_result is not None and not has_monthly_trend:
-            monthly = self._find_monthly_like_table(tables)
+            monthly, consumed = self._resolve_monthly_series(tables)
             if monthly is not None and len(res.figures) < self.MAX_AUTO_FIGURES:
                 res.figures["GMV 趋势与预测"] = self._monthly_sales_fig(monthly, forecast_result)
 
@@ -89,73 +90,135 @@ class VisualizationAgent:
     # Known charts retained for course verification questions
     # ------------------------------------------------------------------
 
-    def _add_known_charts(self, res: VisualizationResult, tables: dict[str, pd.DataFrame], nlp_result: Any, forecast_result: Any, used_tables: set[str]) -> None:
-        monthly_df = self._resolve_monthly_series(tables)
-        if monthly_df is not None:
-            res.figures["月度 GMV 趋势"] = self._monthly_sales_fig(monthly_df, forecast_result)
-            used_tables.add("monthly_sales")
+    INTENT_ALLOW_MONTHLY = {"sales", "forecast", "overall"}
+    INTENT_ALLOW_STATE   = {"sales", "delivery", "overall"}
+    INTENT_ALLOW_PAYMENT = {"payment", "overall"}
+    INTENT_ALLOW_CATEGORY = {"category", "overall"}
+    INTENT_ALLOW_DELIVERY = {"delivery", "overall"}
+    INTENT_ALLOW_WEIGHT  = {"weight_freight", "overall"}
 
-        if self._valid(tables.get("state_sales")):
-            df = self._aggregate_state_sales(tables["state_sales"])
-            if {"customer_state", "total_gmv"}.issubset(df.columns):
-                res.figures["各州销售额气泡图"] = self._state_map_fig(df)
-                res.figures["各州销售额柱状图"] = px.bar(df.head(15), x="customer_state", y="total_gmv", title="各州 GMV 排名")
-                used_tables.add("state_sales")
+    def _add_known_charts(
+        self,
+        res: VisualizationResult,
+        tables: dict[str, pd.DataFrame],
+        nlp_result: Any,
+        forecast_result: Any,
+        used_tables: set[str],
+        intent: str = "",
+    ) -> None:
+        """Generate charts for well-known table names, gated by intent.
 
-        if self._valid(tables.get("state_sales_2017")):
-            df = self._aggregate_state_sales(tables["state_sales_2017"])
-            if {"customer_state", "total_gmv"}.issubset(df.columns):
-                res.figures["2017 各州 GMV 排名"] = px.bar(df.head(20), x="customer_state", y="total_gmv", title="2017 各州 GMV 排名")
-                used_tables.add("state_sales_2017")
+        Intent filtering ensures we don't show payment pie charts when the
+        user only asked about delivery performance.
+        """
+        # ---- monthly GMV trend (sales / forecast / overall only) ----
+        if intent in self.INTENT_ALLOW_MONTHLY:
+            monthly_df, consumed = self._resolve_monthly_series(tables)
+            if monthly_df is not None:
+                res.figures["月度 GMV 趋势"] = self._monthly_sales_fig(monthly_df, forecast_result)
+                used_tables |= consumed
 
-        if self._valid(tables.get("delivery_by_state")):
-            df = tables["delivery_by_state"]
-            if {"customer_state", "avg_delivery_days"}.issubset(df.columns):
-                res.figures["配送准时率/时长"] = self._delivery_fig(df)
-                used_tables.add("delivery_by_state")
+        # ---- state sales ----
+        if intent in self.INTENT_ALLOW_STATE:
+            for key in ("state_sales", "state_sales_2017"):
+                if self._valid(tables.get(key)):
+                    df = self._aggregate_state_sales(tables[key])
+                    if {"customer_state", "total_gmv"}.issubset(df.columns):
+                        title = f"{key.replace('_', ' ').title()} GMV 排名"
+                        res.figures[title] = px.bar(df.head(20), x="customer_state", y="total_gmv", title=title)
+                        if key != "state_sales_2017":
+                            res.figures["各州销售额气泡图"] = self._state_map_fig(df)
+                        used_tables.add(key)
 
-        if self._valid(tables.get("payment_dist")):
-            df = tables["payment_dist"]
-            if {"payment_type", "total_transactions"}.issubset(df.columns):
-                res.figures["支付方式分布"] = px.pie(df, names="payment_type", values="total_transactions", title="支付方式分布")
-                used_tables.add("payment_dist")
+        # ---- delivery ----
+        if intent in self.INTENT_ALLOW_DELIVERY:
+            if self._valid(tables.get("delivery_by_state")):
+                df = tables["delivery_by_state"]
+                if {"customer_state", "avg_delivery_days"}.issubset(df.columns):
+                    res.figures["配送准时率/时长"] = self._delivery_fig(df)
+                    used_tables.add("delivery_by_state")
 
-        if self._valid(tables.get("payment_monthly")):
-            df = tables["payment_monthly"]
-            if {"payment_type", "year_month", "total_transactions"}.issubset(df.columns):
-                res.figures["支付方式月度热力图"] = self._heatmap(df, index="payment_type", columns="year_month", values="total_transactions", title="支付方式 × 月份交易热力图")
-                used_tables.add("payment_monthly")
+        # ---- payment ----
+        if intent in self.INTENT_ALLOW_PAYMENT:
+            if self._valid(tables.get("payment_dist")):
+                df = tables["payment_dist"]
+                if {"payment_type", "total_transactions"}.issubset(df.columns):
+                    res.figures["支付方式分布"] = px.pie(df, names="payment_type", values="total_transactions", title="支付方式分布")
+                    used_tables.add("payment_dist")
 
-        if self._valid(tables.get("top_categories")):
-            df = tables["top_categories"]
-            if {"product_category_english", "total_gmv"}.issubset(df.columns):
-                res.figures["Top 品类 GMV"] = px.bar(df.head(20), x="total_gmv", y="product_category_english", orientation="h", title="Top 品类 GMV")
-                used_tables.add("top_categories")
+            if self._valid(tables.get("payment_monthly")):
+                df = tables["payment_monthly"]
+                if {"payment_type", "year_month", "total_transactions"}.issubset(df.columns):
+                    res.figures["支付方式月度热力图"] = self._heatmap(df, index="payment_type", columns="year_month", values="total_transactions", title="支付方式 × 月份交易热力图")
+                    used_tables.add("payment_monthly")
 
-        if self._valid(tables.get("weight_freight")):
-            df = tables["weight_freight"].copy()
-            if {"product_weight_g", "freight_value"}.issubset(df.columns):
-                size_col = "price" if "price" in df.columns else None
-                kwargs = {}
-                if "delivery_status" in df.columns:
-                    kwargs["color"] = "delivery_status"
-                if size_col:
-                    kwargs["size"] = df[size_col].clip(lower=1, upper=df[size_col].quantile(0.95))
-                res.figures["商品重量 vs 运费"] = px.scatter(df, x="product_weight_g", y="freight_value", title="商品重量与运费关系", **kwargs)
-                used_tables.add("weight_freight")
+        # ---- category ----
+        if intent in self.INTENT_ALLOW_CATEGORY:
+            if self._valid(tables.get("top_categories")):
+                df = tables["top_categories"]
+                if {"product_category_english", "total_gmv"}.issubset(df.columns):
+                    res.figures["Top 品类 GMV"] = px.bar(df.head(20), x="total_gmv", y="product_category_english", orientation="h", title="Top 品类 GMV")
+                    used_tables.add("top_categories")
+
+        # ---- weight / freight ----
+        if intent in self.INTENT_ALLOW_WEIGHT:
+            if self._valid(tables.get("weight_freight")):
+                df = tables["weight_freight"].copy()
+                if {"product_weight_g", "freight_value"}.issubset(df.columns):
+                    size_col = "price" if "price" in df.columns else None
+                    kwargs = {}
+                    if "delivery_status" in df.columns:
+                        kwargs["color"] = "delivery_status"
+                    if size_col:
+                        kwargs["size"] = df[size_col].clip(lower=1, upper=df[size_col].quantile(0.95))
+                    res.figures["商品重量 vs 运费"] = px.scatter(df, x="product_weight_g", y="freight_value", title="商品重量与运费关系", **kwargs)
+                    used_tables.add("weight_freight")
 
     # ------------------------------------------------------------------
     # LLM chart plan execution
     # ------------------------------------------------------------------
 
-    def _execute_chart_plan(self, chart_plan: list[dict], tables: dict[str, pd.DataFrame], res: VisualizationResult) -> None:
+    CHART_TYPES_FOR_INTENT: dict[str, set[str]] = {
+        "sales":        {"line", "bar", "map"},
+        "forecast":     {"line"},
+        "delivery":     {"bar", "map"},
+        "payment":      {"bar", "pie", "heatmap"},
+        "category":     {"bar"},
+        "seller":       {"bar"},
+        "review":       {"bar"},
+        "weight_freight":{"scatter"},
+        "overall":      {"line", "bar", "pie", "scatter", "map", "heatmap"},
+        "custom_sql":   {"line", "bar", "pie", "scatter", "map", "heatmap"},
+    }
+
+    CHART_LIMIT_BY_INTENT: dict[str, int] = {
+        "sales": 3,
+        "forecast": 2,
+        "delivery": 2,
+        "payment": 2,
+        "category": 2,
+        "seller": 2,
+        "review": 2,
+        "weight_freight": 1,
+        "overall": 6,
+        "custom_sql": 4,
+    }
+
+    def _execute_chart_plan(
+        self, chart_plan: list[dict], tables: dict[str, pd.DataFrame],
+        res: VisualizationResult, intent: str = "overall",
+    ) -> None:
+        allowed_types = self.CHART_TYPES_FOR_INTENT.get(intent, self.CHART_TYPES_FOR_INTENT["custom_sql"])
+        max_charts = self.CHART_LIMIT_BY_INTENT.get(intent, 4)
         for chart in chart_plan:
-            if len(res.figures) >= self.MAX_AUTO_FIGURES:
+            if len(res.figures) >= min(max_charts, self.MAX_AUTO_FIGURES):
                 break
             chart_type = chart.get("type", "")
             title = chart.get("title", "")
             table_name = chart.get("table", "")
             if not title or not table_name:
+                continue
+            if chart_type not in allowed_types:
                 continue
 
             df = tables.get(table_name)
@@ -273,7 +336,10 @@ class VisualizationAgent:
     # Dynamic chart inference
     # ------------------------------------------------------------------
 
-    def _infer_figures_from_dataframe(self, table_name: str, df: pd.DataFrame, question: str | None = None) -> list[tuple[str, Any]]:
+    def _infer_figures_from_dataframe(
+        self, table_name: str, df: pd.DataFrame,
+        question: str | None = None, intent: str = "",
+    ) -> list[tuple[str, Any]]:
         work = self._clean_df(df)
         if work.empty:
             return []
@@ -294,43 +360,59 @@ class VisualizationAgent:
         freight_col = self._find_col(work, ["freight_value", "total_freight", "avg_freight"])
         weight_col = self._find_col(work, ["product_weight_g", "weight"])
 
-        # Time series
-        if time_col and value_col:
+        # Intent groups for semantic gating (RC3).
+        _SALES = {"sales", "forecast", "overall", "custom_sql"}
+        _DELIVERY = {"delivery", "overall", "custom_sql"}
+        _PAYMENT = {"payment", "overall", "custom_sql"}
+        _CATEGORY = {"category", "overall", "custom_sql"}
+        _SELLER = {"seller", "overall", "custom_sql"}
+        _REVIEW = {"review", "overall", "custom_sql"}
+        _WEIGHT = {"weight_freight", "overall", "custom_sql"}
+
+        # Time series — only when intent makes sense.
+        if intent in _SALES and time_col and value_col:
             ts = self._prepare_time_series(work, time_col, value_col)
             if not ts.empty:
                 figures.append((f"{table_name} 时间趋势", px.line(ts, x="date", y=value_col, markers=True, title=f"{table_name} 时间趋势")))
 
-        # Geographic/state ranking
-        if state_col and value_col:
+        # Geographic/state ranking — only when intent aligns.
+        if intent in (_SALES | _DELIVERY) and state_col and value_col:
             state_df = work.groupby(state_col, as_index=False)[value_col].sum().sort_values(value_col, ascending=False).head(20)
             figures.append((f"{table_name} 地区排名", px.bar(state_df, x=state_col, y=value_col, title=f"{table_name} 地区排名")))
             if self._looks_like_brazil_state(work[state_col]):
                 figures.append((f"{table_name} 地区气泡图", self._state_map_fig(state_df.rename(columns={state_col: "customer_state", value_col: "total_gmv"}))))
 
-        # Category/payment/seller ranking
-        for label, cat_col in [("品类", category_col), ("支付方式", payment_col), ("卖家", seller_col)]:
-            if cat_col and value_col:
-                agg = work.groupby(cat_col, as_index=False)[value_col].sum().sort_values(value_col, ascending=False).head(20)
-                orientation = "h" if label in {"品类", "卖家"} else "v"
-                if orientation == "h":
-                    figures.append((f"{table_name} {label}排名", px.bar(agg, x=value_col, y=cat_col, orientation="h", title=f"{table_name} {label}排名")))
-                else:
-                    figures.append((f"{table_name} {label}分布", px.bar(agg, x=cat_col, y=value_col, title=f"{table_name} {label}分布")))
-                if label == "支付方式" and len(agg) <= 10:
-                    figures.append((f"{table_name} 支付方式占比", px.pie(agg, names=cat_col, values=value_col, title=f"{table_name} 支付方式占比")))
+        # Category ranking.
+        if intent in (_SALES | _CATEGORY) and category_col and value_col:
+            agg = work.groupby(category_col, as_index=False)[value_col].sum().sort_values(value_col, ascending=False).head(20)
+            figures.append((f"{table_name} 品类排名", px.bar(agg, x=value_col, y=category_col, orientation="h", title=f"{table_name} 品类排名")))
 
-        # Delivery/review score style metrics by category/state
-        if review_score_col and (category_col or seller_col or state_col):
+        # Payment chart.
+        if intent in _PAYMENT and payment_col and value_col:
+            agg = work.groupby(payment_col, as_index=False)[value_col].sum().sort_values(value_col, ascending=False).head(10)
+            figures.append((f"{table_name} 支付方式分布", px.bar(agg, x=payment_col, y=value_col, title=f"{table_name} 支付方式分布")))
+            if len(agg) <= 10:
+                figures.append((f"{table_name} 支付方式占比", px.pie(agg, names=payment_col, values=value_col, title=f"{table_name} 支付方式占比")))
+
+        # Seller ranking.
+        if intent in _SELLER and seller_col and value_col:
+            agg = work.groupby(seller_col, as_index=False)[value_col].sum().sort_values(value_col, ascending=False).head(20)
+            figures.append((f"{table_name} 卖家排名", px.bar(agg, x=value_col, y=seller_col, orientation="h", title=f"{table_name} 卖家排名")))
+
+        # Review score.
+        if intent in (_REVIEW | _SELLER) and review_score_col and (category_col or seller_col or state_col):
             group_col = category_col or seller_col or state_col
             agg = work.groupby(group_col, as_index=False)[review_score_col].mean().sort_values(review_score_col).head(15)
             figures.append((f"{table_name} 平均评分对比", px.bar(agg, x=review_score_col, y=group_col, orientation="h", title=f"{table_name} 平均评分对比")))
 
-        # Weight / freight scatter, or generic two numeric scatter
-        if weight_col and freight_col:
+        # Weight / freight scatter.
+        if intent in _WEIGHT and weight_col and freight_col:
             sample = work[[weight_col, freight_col] + ([category_col] if category_col else [])].dropna().head(5000)
             kwargs = {"color": category_col} if category_col else {}
             figures.append((f"{table_name} 重量与运费关系", px.scatter(sample, x=weight_col, y=freight_col, title=f"{table_name} 重量与运费关系", **kwargs)))
-        elif len(numeric_cols) >= 2 and len(work) >= 2:
+
+        # Generic scatter — only when intent is broad (overall / custom_sql).
+        if intent in {"overall", "custom_sql"} and len(numeric_cols) >= 2 and len(work) >= 2:
             x_col, y_col = self._choose_scatter_cols(work, numeric_cols)
             color_col = category_col or state_col or payment_col
             sample_cols = [x_col, y_col] + ([color_col] if color_col else [])
@@ -339,32 +421,20 @@ class VisualizationAgent:
                 kwargs = {"color": color_col} if color_col else {}
                 figures.append((f"{table_name} 数值关系散点图", px.scatter(sample, x=x_col, y=y_col, title=f"{table_name} 数值关系散点图", **kwargs)))
 
-        # Matrix heatmap: two category columns + one metric.
-        if len(categorical_cols) >= 2 and value_col:
+        # Matrix heatmap: two category columns + one metric — only overall.
+        if intent in {"payment", "overall", "custom_sql"} and len(categorical_cols) >= 2 and value_col:
             c1, c2 = self._choose_heatmap_categories(work, categorical_cols)
             if c1 and c2 and c1 != c2:
                 figures.append((f"{table_name} 交叉热力图", self._heatmap(work, index=c1, columns=c2, values=value_col, title=f"{table_name} 交叉热力图")))
 
-        # Single categorical frequency chart fallback.
-        if not figures and categorical_cols:
-            c = categorical_cols[0]
-            vc = work[c].astype(str).value_counts().head(20).reset_index()
-            vc.columns = [c, "count"]
-            figures.append((f"{table_name} 频次分布", px.bar(vc, x=c, y="count", title=f"{table_name} 频次分布")))
-
-        # Single numeric histogram fallback.
-        if not figures and numeric_cols:
-            c = numeric_cols[0]
-            figures.append((f"{table_name} {c} 分布", px.histogram(work, x=c, title=f"{table_name} {c} 分布")))
-
-        # Reduce duplicates while preserving order.
+        # Reduce duplicates while preserving order (RC7: always dedupe).
         unique: list[tuple[str, Any]] = []
         seen_titles: set[str] = set()
         for title, fig in figures:
             if title not in seen_titles:
                 unique.append((title, fig))
                 seen_titles.add(title)
-        return unique[:3]
+        return unique[:2]
 
     # ------------------------------------------------------------------
     # Specific figure helpers
@@ -469,11 +539,19 @@ class VisualizationAgent:
     def _valid(self, df: Any) -> bool:
         return isinstance(df, pd.DataFrame) and not df.empty
 
-    def _resolve_monthly_series(self, tables: dict[str, pd.DataFrame]) -> pd.DataFrame | None:
-        """Pick or build a monthly GMV series for the trend chart."""
+    def _resolve_monthly_series(
+        self, tables: dict[str, pd.DataFrame]
+    ) -> tuple[pd.DataFrame | None, set[str]]:
+        """Pick or build a monthly GMV series for the trend chart.
+
+        Returns (df, source_keys) where source_keys lists which table names
+        were consumed to produce the series, so they can be marked used.
+        """
+        consumed: set[str] = set()
         candidates: list[pd.DataFrame] = []
         if self._valid(tables.get("monthly_sales")):
             candidates.append(tables["monthly_sales"])
+            consumed.add("monthly_sales")
         for key in ("state_sales", "state_sales_2017"):
             if self._valid(tables.get(key)):
                 df = tables[key]
@@ -481,14 +559,18 @@ class VisualizationAgent:
                     candidates.append(
                         df.groupby("year_month", as_index=False)["total_gmv"].sum().sort_values("year_month")
                     )
+                    consumed.add(key)
 
         for df in candidates:
             if "year_month" in df.columns and "total_gmv" in df.columns and not df.empty:
-                return df.copy()
+                return df.copy(), consumed
             norm = self._normalize_monthly_sales(df)
             if norm is not None and not norm.empty:
-                return norm
-        return self._find_monthly_like_table(tables)
+                return norm, consumed
+        found = self._find_monthly_like_table(tables)
+        if found is not None:
+            consumed.add("_monthly_like")
+        return found, consumed
 
     def _aggregate_state_sales(self, df: pd.DataFrame) -> pd.DataFrame:
         """When state table has month granularity, aggregate to state ranking."""

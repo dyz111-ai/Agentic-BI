@@ -87,6 +87,7 @@ class DataAnalysisAgent:
         intent = str(plan.get("intent", "custom_sql")).strip()
         if intent not in self.ALLOWED_INTENTS:
             intent = "custom_sql"
+        intent = self._refine_intent(question, intent)
         queries = plan.get("queries") or []
         if not queries:
             raise ValueError("LLM 没有返回 queries")
@@ -464,8 +465,6 @@ charts 根据规则 14 填写，请尽可能填写所需图表，实在不确定
     # ----------------------- deterministic fallback path -----------------------
     def _rule_analyze(self, question: str) -> DataResult:
         q = question.lower()
-        if self._is_overall(q):
-            return self._overall()
         if self._has_forecast(q):
             return self._forecast_data()
         if self._has_review(q):
@@ -480,6 +479,8 @@ charts 根据规则 14 填写，请尽可能填写所需图表，实在不确定
             return self._category()
         if self._has_seller(q):
             return self._seller()
+        if self._is_overall(q):
+            return self._overall()
         return self._sales()
 
     def _run(self, name: str, sql: str, params: dict | None = None):
@@ -512,6 +513,26 @@ charts 根据规则 14 填写，请尽可能填写所需图表，实在不确定
     def _is_overall(q: str) -> bool:
         keys = ["整体", "全局", "运营", "三大", "策略", "优化", "overall", "strategy"]
         return any(k in q for k in keys)
+
+    @classmethod
+    def _refine_intent(cls, question: str, raw_intent: str) -> str:
+        """If LLM returns 'overall' but strong specific keywords exist, downgrade.
+
+        Exception: when what-if / anomaly keywords are present, keep 'overall'
+        so the orchestrator can fire the full what-if + anomaly pipeline.
+        """
+        if raw_intent != "overall":
+            return raw_intent
+        q = question.lower()
+        what_if_signals = {"如果", "假设", "下架", "模拟", "what-if", "移除", "会怎样", "提升多少"}
+        anomaly_signals = {"异常", "骤降", "突升", "预警", "报警"}
+        if any(s in q for s in what_if_signals | anomaly_signals):
+            return "overall"
+        for name in ("delivery", "payment", "category", "seller", "review", "forecast", "weight_freight"):
+            checker = getattr(cls, f"_has_{name}", None)
+            if checker and checker(q):
+                return name
+        return raw_intent
 
     @staticmethod
     def _has_forecast(q: str) -> bool:
@@ -601,7 +622,6 @@ charts 根据规则 14 填写，请尽可能填写所需图表，实在不确定
                 GROUP BY customer_state
                 ORDER BY avg_delivery_days DESC
             """,
-            "delivery_monthly": self._sql_order_monthly("mv_delivery_perf", "avg_delivery_days DESC"),
         }
         for name, sql in queries.items():
             n, df, e = self._run(name, sql)
@@ -633,7 +653,6 @@ charts 根据规则 14 填写，请尽可能填写所需图表，实在不确定
                 GROUP BY payment_type
                 ORDER BY total_transactions DESC
             """,
-            "payment_monthly": self._sql_order_monthly("mv_payment_dist", "total_value DESC"),
         }
         for name, sql in queries.items():
             n, df, e = self._run(name, sql)
@@ -664,9 +683,8 @@ charts 根据规则 14 填写，请尽可能填写所需图表，实在不确定
                 FROM mv_category_sales
                 GROUP BY product_category_english
                 ORDER BY total_gmv DESC
-                LIMIT 15
+            LIMIT 15
             """,
-            "category_monthly": self._sql_order_monthly("mv_category_sales", "total_gmv DESC"),
         }
         for name, sql in queries.items():
             n, df, e = self._run(name, sql)

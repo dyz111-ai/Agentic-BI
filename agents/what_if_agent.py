@@ -73,6 +73,12 @@ class WhatIfAgent:
 
         df = self._normalize_seller_data(seller_data)
         if df is None:
+            fallback = self._fetch_seller_perf()
+            if fallback is not None and not fallback.empty:
+                seller_data = fallback
+                df = self._normalize_seller_data(seller_data)
+
+        if df is None:
             return WhatIfResult(
                 summary="卖家数据缺少必要字段（avg_review_score / total_orders），无法执行模拟。",
                 scenario=f"移除评分最低的 {top_n} 个卖家 — 模拟未执行：字段缺失。",
@@ -165,9 +171,35 @@ class WhatIfAgent:
                 HAVING total_orders > 0
                 ORDER BY avg_review_score ASC
             """
-            return read_df(sql, engine=self.engine)
+            df = read_df(sql, engine=self.engine)
+            if df is not None and not df.empty:
+                return df
         except Exception:
-            return None
+            pass
+
+        try:
+            from utils.db import read_df
+            sql = """
+                SELECT oi.seller_id,
+                       COALESCE(s.seller_state, 'unknown') AS seller_state,
+                       COUNT(DISTINCT oi.order_id) AS total_orders,
+                       ROUND(AVG(r.review_score), 2) AS avg_review_score,
+                       ROUND(SUM(oi.price + oi.freight_value), 2) AS total_gmv
+                FROM order_items oi
+                LEFT JOIN sellers s ON oi.seller_id = s.seller_id
+                LEFT JOIN order_reviews r ON oi.order_id = r.order_id
+                WHERE r.review_score IS NOT NULL
+                GROUP BY oi.seller_id, s.seller_state
+                HAVING COUNT(DISTINCT oi.order_id) >= 2
+                ORDER BY AVG(r.review_score) ASC
+                LIMIT 200
+            """
+            df = read_df(sql, engine=self.engine)
+            if df is not None and not df.empty:
+                return df
+        except Exception:
+            pass
+        return None
 
     def _normalize_seller_data(self, df: pd.DataFrame) -> pd.DataFrame | None:
         work = df.copy()

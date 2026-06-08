@@ -216,16 +216,15 @@ class OrchestratorAgent:
         ]) or any(a in required_agents for a in {"what_if", "whatif", "simulation", "whatifagent"})
         what_if_by_question = any(h.lower() in q for h in self.WHAT_IF_HINTS)
         what_if_by_data = self._find_seller_dataframe(data_result.tables) is not None
-        what_if_by_intent_fallback = getattr(data_result, "intent", "") in {"seller", "overall"}
-        needs_what_if = bool(what_if_by_plan or what_if_by_question or what_if_by_intent_fallback)
+        what_if_by_intent_fallback = getattr(data_result, "intent", "") in {"seller"}
+        needs_what_if = bool(what_if_by_plan or what_if_by_question or (what_if_by_data and what_if_by_intent_fallback))
 
         anomaly_by_plan = self._truthy_any(data_plan, [
             "needs_anomaly", "requires_anomaly", "needs_alert", "requires_alert",
             "needs_monitoring", "requires_monitoring",
         ]) or any(a in required_agents for a in {"anomaly", "alert", "monitoring", "anomalydetectionagent"})
         anomaly_by_question = any(h.lower() in q for h in self.ANOMALY_HINTS)
-        anomaly_by_intent_fallback = getattr(data_result, "intent", "") in {"overall"}
-        needs_anomaly = bool(anomaly_by_plan or anomaly_by_question or anomaly_by_intent_fallback)
+        needs_anomaly = bool(anomaly_by_plan or anomaly_by_question)
 
         # overall 问题通常需要多维综合；如果 DataAgent 已返回历史销售序列，也允许补充预测。
         if getattr(data_result, "intent", "") == "overall" and forecast_by_data:
@@ -249,7 +248,7 @@ class OrchestratorAgent:
                 plan=what_if_by_plan, question=what_if_by_question, data=what_if_by_data, intent=what_if_by_intent_fallback
             ),
             "anomaly_reason": self._reason_flags(
-                plan=anomaly_by_plan, question=anomaly_by_question, intent=anomaly_by_intent_fallback
+                plan=anomaly_by_plan, question=anomaly_by_question
             ),
             "returned_tables": list(data_result.tables.keys()),
             "returned_schema": table_schema,
@@ -351,15 +350,20 @@ class OrchestratorAgent:
                 continue
             cols = {str(c).lower() for c in df.columns}
             score = 0
-            if "avg_review_score" in cols:
+            has_score = "avg_review_score" in cols or "review_score" in cols
+            has_seller = "seller_id" in cols
+            has_orders = "total_orders" in cols or "order_count" in cols
+            if not (has_score and has_orders):
+                continue
+            if has_score:
                 score += 3
-            if "seller_id" in cols:
+            if has_seller:
                 score += 2
-            if "total_orders" in cols:
+            if has_orders:
                 score += 2
             if any("seller" in c or "score" in c for c in cols):
                 score += 1
-            if score > 0:
+            if score > 4:
                 candidates.append((score, name, df))
         if not candidates:
             return None
@@ -452,6 +456,8 @@ class OrchestratorAgent:
             data_result=data_result,
             nlp_result=nlp_result,
             forecast_result=forecast_result,
+            what_if_result=what_if_result,
+            anomaly_result=anomaly_result,
         )
         recommendations = [r.strip() for r in decision_result.recommendations if r and r.strip()]
         if not recommendations:
@@ -496,12 +502,15 @@ class OrchestratorAgent:
         data_result: DataResult,
         nlp_result: NLPResult | None,
         forecast_result: ForecastResult | None,
+        what_if_result: WhatIfResult | None = None,
+        anomaly_result: AnomalyResult | None = None,
     ) -> tuple[list[str], list[str]]:
         """LLM 合成直接回答与关键发现；失败或数据为空时用结构化兜底，禁止模板空话。"""
         if self.llm.enabled:
             try:
                 direct, findings = self._llm_synthesize_narrative(
-                    question, data_result, nlp_result, forecast_result
+                    question, data_result, nlp_result, forecast_result,
+                    what_if_result, anomaly_result,
                 )
                 if direct or findings:
                     return direct, findings
@@ -517,6 +526,8 @@ class OrchestratorAgent:
         data_result: DataResult,
         nlp_result: NLPResult | None,
         forecast_result: ForecastResult | None,
+        what_if_result: WhatIfResult | None = None,
+        anomaly_result: AnomalyResult | None = None,
     ) -> dict[str, Any]:
         evidence: dict[str, Any] = {
             "question_intent": getattr(data_result, "intent", ""),
@@ -540,6 +551,10 @@ class OrchestratorAgent:
             evidence["nlp_summary"] = nlp_result.summary
         if forecast_result and getattr(forecast_result, "summary", ""):
             evidence["forecast_summary"] = forecast_result.summary
+        if what_if_result is not None and what_if_result.has_result:
+            evidence["what_if_summary"] = what_if_result.summary
+        if anomaly_result is not None and anomaly_result.has_alerts:
+            evidence["anomaly_summary"] = anomaly_result.summary
         return evidence
 
     def _has_usable_sales_data(self, data_result: DataResult) -> bool:
@@ -561,6 +576,20 @@ class OrchestratorAgent:
                         return True
         return False
 
+    def _has_usable_data(self, data_result: DataResult) -> bool:
+        """Check whether data_result contains any non-empty table.
+
+        Replaces narrow GMV-only check with intent-agnostic check so
+        weight_freight / review / delivery / payment tables are recognised.
+        """
+        tables = data_result.tables or {}
+        for df in tables.values():
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            if len(df) > 0:
+                return True
+        return False
+
     def _empty_data_direct_answer(self, question: str, data_result: DataResult) -> list[str]:
         q = question.lower()
         asks_sales = any(k in q for k in ["gmv", "销售", "营收", "2017", "趋势", "州", "排名"])
@@ -569,7 +598,7 @@ class OrchestratorAgent:
                 "本次查询未返回有效的 GMV 或销售明细数据。",
                 "请确认：① MySQL 是否已导入 Olist 订单 CSV；② 侧边栏是否已点击「刷新预聚合表」；③ 数据库连接是否指向含数据的环境。",
             ]
-        if getattr(data_result, "llm_error", ""):
+        if getattr(data_result, "llm_error", "") and not self._has_usable_data(data_result):
             return [f"数据查询未完成：{data_result.llm_error[:200]}"]
         return ["本次查询未返回可用数据，请检查数据库连接与预聚合表是否已刷新。"]
 
@@ -579,9 +608,13 @@ class OrchestratorAgent:
         data_result: DataResult,
         nlp_result: NLPResult | None,
         forecast_result: ForecastResult | None,
+        what_if_result: WhatIfResult | None = None,
+        anomaly_result: AnomalyResult | None = None,
     ) -> tuple[list[str], list[str]]:
-        evidence = self._build_narrative_evidence(data_result, nlp_result, forecast_result)
-        has_data = self._has_usable_sales_data(data_result)
+        evidence = self._build_narrative_evidence(
+            data_result, nlp_result, forecast_result, what_if_result, anomaly_result,
+        )
+        has_data = self._has_usable_data(data_result)
 
         if not has_data:
             return self._empty_data_direct_answer(question, data_result), []
@@ -711,7 +744,7 @@ class OrchestratorAgent:
             lines.append(forecast_result.summary.strip())
 
         if not lines:
-            if not self._has_usable_sales_data(data_result):
+            if not self._has_usable_data(data_result):
                 lines = self._empty_data_direct_answer(question, data_result)
             else:
                 fallback = self._fallback_direct_from_summary(data_result.summary)
@@ -772,7 +805,7 @@ class OrchestratorAgent:
             insights.append(forecast_result.summary)
 
         if not insights:
-            if not self._has_usable_sales_data(data_result):
+            if not self._has_usable_data(data_result):
                 return []
             insights.append("可从区域、品类、时间三个维度对比核心 KPI，识别增长或风险点。")
         return self._dedupe_lines(insights)[:5]
