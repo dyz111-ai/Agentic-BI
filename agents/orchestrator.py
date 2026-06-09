@@ -16,6 +16,7 @@ from agents.decision_agent import DecisionIntelligenceAgent, DecisionResult
 from agents.what_if_agent import WhatIfAgent, WhatIfResult
 from agents.anomaly_agent import AnomalyDetectionAgent, AnomalyResult
 from utils.llm import LLMClient
+from utils.conversation_memory import build_context_prompt, normalize_memory, extract_key_entities
 
 
 @dataclass
@@ -86,10 +87,16 @@ class OrchestratorAgent:
         self.what_if_agent = WhatIfAgent(engine)
         self.anomaly_agent = AnomalyDetectionAgent(engine)
         self.llm = LLMClient()
-        self.memory: dict[str, Any] = {}
 
-    def handle(self, question: str) -> OrchestratorResult:
-        data_result = self.data_agent.analyze(question)
+    def handle(self, question: str, memory: dict[str, Any] | None = None) -> OrchestratorResult:
+        memory = normalize_memory(memory)
+        conversation_context = build_context_prompt(memory)
+
+        data_result = self.data_agent.analyze(
+            question,
+            conversation_context=conversation_context,
+            memory=memory,
+        )
 
         plan = self._build_orchestration_plan(question, data_result)
 
@@ -144,7 +151,12 @@ class OrchestratorAgent:
             chart_plan=getattr(data_result, "chart_plan", None) or None,
         )
         decision_result = self.decision_agent.generate(
-            question, data_result, nlp_result, forecast_result, what_if_result
+            question,
+            data_result,
+            nlp_result,
+            forecast_result,
+            what_if_result,
+            conversation_context=conversation_context,
         )
 
         final_answer, direct_answer, findings, recommendations, technical_details = self._compose_answer(
@@ -157,12 +169,17 @@ class OrchestratorAgent:
             anomaly_result=anomaly_result,
             visualization_result=visualization_result,
             orchestration_plan=plan,
+            conversation_context=conversation_context,
+            memory=memory,
         )
 
-        self.memory["last_question"] = question
-        self.memory["last_intent"] = data_result.intent
-        self.memory["last_tables"] = list(data_result.tables.keys())
-        self.memory["last_orchestration_plan"] = plan
+        key_entities = extract_key_entities(data_result, nlp_result)
+        updated_memory = dict(memory)
+        updated_memory["last_question"] = question
+        updated_memory["last_intent"] = data_result.intent
+        updated_memory["last_tables"] = list(data_result.tables.keys())
+        updated_memory["last_orchestration_plan"] = plan
+        updated_memory["last_key_entities"] = key_entities
 
         return OrchestratorResult(
             question=question,
@@ -178,7 +195,7 @@ class OrchestratorAgent:
             findings=findings,
             recommendations=recommendations,
             technical_details=technical_details,
-            memory=self.memory.copy(),
+            memory=updated_memory,
             orchestration_plan=plan,
         )
 
@@ -450,6 +467,8 @@ class OrchestratorAgent:
         anomaly_result: AnomalyResult | None,
         visualization_result: VisualizationResult,
         orchestration_plan: dict[str, Any],
+        conversation_context: str = "",
+        memory: dict[str, Any] | None = None,
     ) -> tuple[str, list[str], list[str], list[str], dict[str, Any]]:
         direct_answer, findings = self._synthesize_narrative(
             question=question,
@@ -458,10 +477,12 @@ class OrchestratorAgent:
             forecast_result=forecast_result,
             what_if_result=what_if_result,
             anomaly_result=anomaly_result,
+            conversation_context=conversation_context,
         )
         recommendations = [r.strip() for r in decision_result.recommendations if r and r.strip()]
+        recommendations = self._filter_user_facing_lines(recommendations)
         if not recommendations:
-            recommendations = ["暂无具体建议，请结合上方分析结果与图表进一步制定运营动作。"]
+            recommendations = ["建议结合上方图表与数据明细，制定下一步运营动作。"]
 
         technical_details = self._build_technical_details(
             data_result=data_result,
@@ -471,6 +492,7 @@ class OrchestratorAgent:
             anomaly_result=anomaly_result,
             visualization_result=visualization_result,
             orchestration_plan=orchestration_plan,
+            memory=memory,
         )
 
         lines: list[str] = []
@@ -504,6 +526,7 @@ class OrchestratorAgent:
         forecast_result: ForecastResult | None,
         what_if_result: WhatIfResult | None = None,
         anomaly_result: AnomalyResult | None = None,
+        conversation_context: str = "",
     ) -> tuple[list[str], list[str]]:
         """LLM 合成直接回答与关键发现；失败或数据为空时用结构化兜底，禁止模板空话。"""
         if self.llm.enabled:
@@ -511,8 +534,12 @@ class OrchestratorAgent:
                 direct, findings = self._llm_synthesize_narrative(
                     question, data_result, nlp_result, forecast_result,
                     what_if_result, anomaly_result,
+                    conversation_context=conversation_context,
                 )
                 if direct or findings:
+                    direct, findings = self._merge_and_sanitize_narrative(
+                        question, data_result, nlp_result, forecast_result, direct, findings,
+                    )
                     return direct, findings
             except Exception:
                 pass
@@ -610,6 +637,7 @@ class OrchestratorAgent:
         forecast_result: ForecastResult | None,
         what_if_result: WhatIfResult | None = None,
         anomaly_result: AnomalyResult | None = None,
+        conversation_context: str = "",
     ) -> tuple[list[str], list[str]]:
         evidence = self._build_narrative_evidence(
             data_result, nlp_result, forecast_result, what_if_result, anomaly_result,
@@ -620,8 +648,12 @@ class OrchestratorAgent:
             return self._empty_data_direct_answer(question, data_result), []
 
         evidence_text = json.dumps(evidence, ensure_ascii=False, default=str, indent=2)
+        if conversation_context:
+            question_block = f"{conversation_context.rstrip()}\n{question}"
+        else:
+            question_block = f"用户问题：{question}"
         prompt = f"""
-用户问题：{question}
+{question_block}
 
 以下是系统真实查询得到的结构化数据（仅供你分析，不要在回答中出现 JSON、evidence、字段名等技术词汇）：
 
@@ -637,8 +669,9 @@ class OrchestratorAgent:
 1. 必须引用查询结果中的具体数字（GMV、州名、月份、评分等）。
 2. 禁止输出「已根据查询结果生成图表」「建议结合图表继续分析」等空话。
 3. 禁止出现 evidence_json、JSON、SQL、预聚合表名、ETL 等内部术语。
-4. 若某指标在数据中不存在或为空，明确写「当前查询未返回该指标」，不要编造。
-5. 只返回 JSON，不要 Markdown。
+4. 只回答有数据支撑的部分；若某维度不在查询结果中，直接省略该维度，禁止写「未返回」「无法分析」「缺少数据」等表述。
+5. 若提供了【会话上下文】，请结合上一轮问题与结论理解当前追问（如「那个州呢」），回答须与上下文连贯。
+6. 只返回 JSON，不要 Markdown。
 """
         content = self.llm.chat(
             [
@@ -654,6 +687,75 @@ class OrchestratorAgent:
         direct = self._filter_boilerplate(direct)
         findings = self._filter_boilerplate(findings)
         return self._dedupe_lines(direct)[:4], self._dedupe_lines(findings)[:5]
+
+    def _filter_user_facing_lines(self, lines: list[str]) -> list[str]:
+        out: list[str] = []
+        for line in lines:
+            text = (line or "").strip()
+            if not text:
+                continue
+            if any(p in text for p in self.UNAVAILABLE_PHRASES):
+                continue
+            out.append(text)
+        return out
+
+    def _question_asks_state(self, question: str) -> bool:
+        q = question.lower()
+        return any(k in q for k in ["各州", "州", "排名", "state", "region", "区域"])
+
+    def _merge_and_sanitize_narrative(
+        self,
+        question: str,
+        data_result: DataResult,
+        nlp_result: NLPResult | None,
+        forecast_result: ForecastResult | None,
+        direct: list[str],
+        findings: list[str],
+    ) -> tuple[list[str], list[str]]:
+        """Strip unavailable-data boilerplate; backfill from rule-based synthesis when data exists."""
+        direct = self._filter_user_facing_lines(direct)
+        findings = self._filter_user_facing_lines(findings)
+
+        rule_direct = self._synthesize_direct_answer(question, data_result, nlp_result, forecast_result)
+        rule_findings = self._collect_insights(
+            question, data_result, nlp_result, forecast_result, direct_answer=rule_direct,
+        )
+
+        blob = " ".join(direct + findings)
+        if self._question_asks_state(question):
+            state_df = self._get_state_ranking_df(data_result.tables or {})
+            if state_df is not None and not state_df.empty:
+                has_state_answer = any(
+                    kw in blob for kw in ("位居", "排名第一", "分列", "Top", "最高", "GMV 为")
+                ) and "州" in blob
+                if not has_state_answer:
+                    for line in rule_direct:
+                        if "州" in line and line not in direct:
+                            direct.append(line)
+
+        if not direct and rule_direct:
+            direct = rule_direct[:4]
+        if not findings and rule_findings:
+            findings = rule_findings[:5]
+
+        return self._dedupe_lines(direct)[:4], self._dedupe_lines(findings)[:5]
+
+    UNAVAILABLE_PHRASES = (
+        "当前查询未返回",
+        "未返回该",
+        "未返回任何",
+        "无法提供",
+        "无法分析",
+        "无法基于",
+        "不包含",
+        "缺少",
+        "请要求数据团队",
+        "请确认订单",
+        "数据团队补充",
+        "无法进行区域",
+        "无法制定",
+        "在此期间，建议手动",
+    )
 
     BOILERPLATE_PHRASES = (
         "已根据查询结果生成图表",
@@ -832,6 +934,7 @@ class OrchestratorAgent:
         anomaly_result: AnomalyResult | None,
         visualization_result: VisualizationResult,
         orchestration_plan: dict[str, Any],
+        memory: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         routing = getattr(data_result, "routing_method", "rule")
         if routing == "llm":
@@ -841,6 +944,9 @@ class OrchestratorAgent:
         else:
             query_mode = "本地规则兜底（未配置 LLM Key）"
 
+        memory = normalize_memory(memory)
+        prior_turns = len(memory.get("turns") or [])
+
         return {
             "query_mode": query_mode,
             "data_source": "预聚合表 mv_*" if data_result.used_preaggregation else "基础表 / 自定义 SQL",
@@ -849,6 +955,9 @@ class OrchestratorAgent:
             "chart_mode": "LLM 图表规划" if (getattr(data_result, "chart_plan", None) or None) else "规则推断",
             "llm_error": getattr(data_result, "llm_error", "") or "",
             "returned_tables": orchestration_plan.get("returned_tables", []),
+            "orchestrator": "OrchestratorAgent",
+            "conversation_turns": prior_turns + 1,
+            "multi_turn_enabled": True,
             "agents": {
                 "评论洞察": {"called": nlp_result is not None, "reason": self._humanize_reasons(orchestration_plan.get("review_reason", []))},
                 "销售预测": {"called": forecast_result is not None, "reason": self._humanize_reasons(orchestration_plan.get("forecast_reason", []))},

@@ -37,6 +37,22 @@ class DecisionIntelligenceAgent:
         "mv_state_sales", "预聚合层", "数据血源", "增量+全量", "order_purchase_timestamp",
     )
 
+    UNAVAILABLE_PHRASES = (
+        "当前查询未返回",
+        "未返回该",
+        "未返回任何",
+        "无法提供",
+        "无法分析",
+        "无法基于",
+        "请要求数据团队",
+        "请确认订单",
+        "数据团队补充",
+        "无法进行区域",
+        "无法制定",
+        "缺少按州",
+        "查询结果未返回",
+    )
+
     def __init__(self):
         self.llm = LLMClient()
 
@@ -47,12 +63,13 @@ class DecisionIntelligenceAgent:
         nlp_result: Any = None,
         forecast_result: Any = None,
         what_if_result: Any = None,
+        conversation_context: str = "",
     ) -> DecisionResult:
         evidence = self._build_evidence_packet(data_result, nlp_result, forecast_result, what_if_result)
         local_summary = self._local_summary_from_evidence(evidence)
 
         if self.llm.enabled:
-            prompt = self._build_llm_prompt(question, evidence)
+            prompt = self._build_llm_prompt(question, evidence, conversation_context=conversation_context)
             text = self.llm.chat(
                 [
                     {
@@ -72,20 +89,21 @@ class DecisionIntelligenceAgent:
             if text and not text.startswith("LLM 调用失败"):
                 recs = self._parse_recommendations(text)
                 recs = self._remove_unsafe_or_empty_recs(recs, evidence)
+                recs = self._filter_user_facing_recs(recs, evidence, question)
                 if recs:
                     return DecisionResult(
                         recommendations=recs,
                         summary="已基于真实查询结果、评论洞察和预测结果生成决策建议。",
                     )
 
-        recs = self._rule_based_recommendations_from_evidence(evidence)
+        recs = self._rule_based_recommendations_from_evidence(evidence, question)
         return DecisionResult(recommendations=recs, summary=local_summary)
 
     # ------------------------------------------------------------------
     # LLM prompt and parsing
     # ------------------------------------------------------------------
 
-    def _build_llm_prompt(self, question: str, evidence: dict[str, Any]) -> str:
+    def _build_llm_prompt(self, question: str, evidence: dict[str, Any], conversation_context: str = "") -> str:
         evidence_json = json.dumps(evidence, ensure_ascii=False, default=str, indent=2)
         has_tables = bool(evidence.get("tables"))
         empty_hint = ""
@@ -95,8 +113,12 @@ class DecisionIntelligenceAgent:
                 "先确认订单数据是否已导入、预聚合表是否已刷新，再重新分析。"
                 "禁止写 ETL、数据血源、evidence_json 等技术用语。"
             )
+        if conversation_context:
+            question_block = f"{conversation_context.rstrip()}\n{question}"
+        else:
+            question_block = f"用户问题：{question}"
         return f"""
-用户问题：{question}
+{question_block}
 
 下面是系统真实查询得到的结构化数据（仅供你阅读，不要在回答里出现 JSON 或字段名）：
 
@@ -108,10 +130,12 @@ class DecisionIntelligenceAgent:
 硬性规则：
 1. 禁止使用“假设”“假定”“示例数据”“可能如下”等表达。
 2. 禁止编造查询结果中不存在的品类、州、卖家、评分、差评率、订单量、GMV。
-3. 若某项指标缺失，写“当前查询未返回该指标”，并给出可执行补救动作（如刷新预聚合、检查数据导入）。
-4. 如果某个品类/卖家的 total_reviews 较小，必须提示“样本量偏小，结论仅作为风险预警”。
+3. 若某项指标缺失，直接跳过该维度，不要写「未返回」「无法分析」或要求用户补数据的表述。
+4. 如果某个品类/卖家的 total_reviews 较小，必须提示「样本量偏小，结论仅作为风险预警」。
 5. 每条建议用自然中文，格式为「数据依据：…。具体动作：…。」；禁止出现 evidence_json、SQL、表名等技术词。
-6. 输出格式：每条建议单独一行，以“- ”开头；不要标题、不要编号、不要 Markdown 小标题。
+6. 输出格式：每条建议单独一行，以「- 」开头；不要标题、不要编号、不要 Markdown 小标题。
+7. 若提供了【会话上下文】，当前问题可能是追问；请结合上一轮分析结论给出连贯建议，正确理解「那个州/该品类」等指代。
+8. 禁止编造预测结果；仅当查询证据中包含 forecast 摘要时，才可给出预测相关建议。
 """
 
     @staticmethod
@@ -262,11 +286,23 @@ class DecisionIntelligenceAgent:
         evidence = self._build_evidence_packet(data_result, nlp_result, forecast_result)
         return self._rule_based_recommendations_from_evidence(evidence)
 
-    def _rule_based_recommendations_from_evidence(self, evidence: dict[str, Any]) -> list[str]:
+    def _rule_based_recommendations_from_evidence(self, evidence: dict[str, Any], question: str = "") -> list[str]:
         recs: list[str] = []
         tables = evidence.get("tables", {}) or {}
         nlp = evidence.get("nlp", {}) or {}
         forecast = evidence.get("forecast", {}) or {}
+
+        # State sales ranking.
+        states = tables.get("state_sales_2017") or tables.get("state_sales")
+        if states:
+            row = states[0]
+            state = row.get("customer_state") or row.get("state")
+            gmv = row.get("total_gmv")
+            if state:
+                msg = f"GMV 最高的州为 {state}"
+                if gmv is not None:
+                    msg += f"（约 {float(gmv):,.2f}）"
+                recs.append(f"{msg}。建议在该州加强库存与物流资源投入，并复制其高转化品类的运营打法到其他区域。")
 
         # Delivery recommendations.
         delivery = tables.get("delivery_by_state") or tables.get("delivery_monthly")
@@ -353,7 +389,7 @@ class DecisionIntelligenceAgent:
 
         # Forecast.
         fc_summary = forecast.get("summary")
-        if fc_summary:
+        if fc_summary and forecast.get("forecast_rows"):
             recs.append(f"预测结果显示：{fc_summary} 建议提前规划广告预算、库存补货和物流资源，避免需求变化造成缺货或配送延迟。")
 
         # What-If simulation.
@@ -369,9 +405,29 @@ class DecisionIntelligenceAgent:
         if not recs:
             if not tables:
                 recs = [
-                    "数据依据：当前查询未返回销售、配送、支付或评论等结构化指标。具体动作：请先确认订单 CSV 是否已导入数据库，并在系统中刷新预聚合表后重新提问。",
-                    "数据依据：无法基于空结果制定分区域或分品类策略。具体动作：完成数据导入后，优先分析 2017 年月度 GMV 与各州排名，再制定运营重点。",
+                    "数据依据：本次分析尚未拿到足够的结构化指标。具体动作：可在侧边栏点击「刷新预聚合表」后重新提问，或换一种更具体的问法（如按月 GMV、各州排名）。",
                 ]
             else:
-                recs = ["当前查询结果提供的结构化指标较少。建议先补充销售、配送、支付、评论四类核心 KPI 后，再制定分区域、分品类、分卖家的运营策略。"]
-        return recs[:6]
+                recs = ["建议结合上方图表与数据明细，从销售、配送、支付、评论四个维度制定下一步运营动作。"]
+        return self._filter_user_facing_recs(recs[:6], evidence, question)
+
+    def _filter_user_facing_recs(
+        self,
+        recs: list[str],
+        evidence: dict[str, Any],
+        question: str,
+    ) -> list[str]:
+        q = question.lower()
+        asks_forecast = any(k in q for k in ["预测", "未来", "forecast", "6周", "六周"])
+        forecast_ev = evidence.get("forecast") or {}
+        has_forecast = bool(forecast_ev.get("summary") or forecast_ev.get("forecast_rows"))
+
+        safe: list[str] = []
+        for rec in recs:
+            if any(p in rec for p in self.UNAVAILABLE_PHRASES):
+                continue
+            if not asks_forecast and not has_forecast:
+                if any(k in rec for k in ("预测模型", "未来6周", "未来 6 周", "Prophet", "yhat")):
+                    continue
+            safe.append(rec)
+        return safe[:5]

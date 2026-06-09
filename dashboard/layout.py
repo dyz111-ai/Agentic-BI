@@ -3,6 +3,30 @@ from __future__ import annotations
 import streamlit as st
 import pandas as pd
 
+_USER_UNAVAILABLE_PHRASES = (
+    "当前查询未返回",
+    "未返回该",
+    "未返回任何",
+    "无法提供",
+    "无法分析",
+    "无法基于",
+    "请要求数据团队",
+    "数据中不包含",
+    "缺少按州",
+)
+
+
+def _filter_user_visible_lines(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    for line in lines or []:
+        text = str(line).strip()
+        if not text:
+            continue
+        if any(p in text for p in _USER_UNAVAILABLE_PHRASES):
+            continue
+        out.append(text)
+    return out
+
 
 def render_direct_answer(direct_answer: list[str]):
     if not direct_answer:
@@ -134,7 +158,7 @@ def render_technical_details(details: dict):
             st.warning(note)
 
 
-def render_report(result):
+def render_report(result, key_prefix: str = ""):
     """Render analysis result with clear sections."""
     tab_summary, tab_charts, tab_data = st.tabs(["分析结论", "图表", "数据与 SQL"])
 
@@ -152,11 +176,53 @@ def render_report(result):
         render_metrics(getattr(result.data_result, "elapsed", {}) or {})
 
     with tab_charts:
-        render_figures(result.visualization_result.figures)
+        render_figures(result.visualization_result.figures, key_prefix=key_prefix)
 
     with tab_data:
         render_sql_blocks(result.data_result.sql_blocks)
         render_tables(result.data_result.tables)
+
+
+def render_chat_summary(result) -> None:
+    """Compact assistant reply shown in the chat bubble."""
+    direct = getattr(result, "direct_answer", None) or []
+    findings = getattr(result, "findings", None) or []
+    recommendations = (
+        getattr(result, "recommendations", None)
+        or getattr(getattr(result, "decision_result", None), "recommendations", None)
+        or []
+    )
+    recommendations = _filter_user_visible_lines(recommendations)
+
+    if direct:
+        st.markdown("**直接回答**")
+        render_direct_answer(_filter_user_visible_lines(direct))
+    if findings:
+        st.markdown("**关键发现**")
+        render_findings(_filter_user_visible_lines(findings))
+    if recommendations:
+        st.markdown("**决策建议**")
+        render_recommendations(recommendations)
+
+    what_if = getattr(result, "what_if_result", None)
+    if what_if is not None and getattr(what_if, "has_result", False):
+        st.caption(f"🔮 What-If：{getattr(what_if, 'summary', '')[:120]}")
+
+    anomaly = getattr(result, "anomaly_result", None)
+    if anomaly is not None and getattr(anomaly, "has_alerts", False):
+        st.caption(f"🔍 异常预警：发现 {getattr(anomaly, 'alert_count', 0)} 条异常")
+
+    if not direct and not findings and not recommendations:
+        st.info("分析已完成，请展开下方查看详细报告。")
+
+
+def render_chat_assistant(result, turn_id: int = 0) -> None:
+    """Render one assistant turn: summary in bubble + full report in expander."""
+    render_chat_summary(result)
+    figures = getattr(getattr(result, "visualization_result", None), "figures", None) or {}
+    chart_n = len(figures)
+    with st.expander(f"📊 查看完整分析报告（含 {chart_n} 张图表 · SQL · 技术细节）", expanded=False):
+        render_report(result, key_prefix=f"turn{turn_id}_")
 
 
 def render_history_item(item: dict, compact: bool = False):
@@ -221,13 +287,13 @@ def render_tables(tables: dict[str, pd.DataFrame]):
         st.dataframe(df.head(200), width='stretch')
 
 
-def render_figures(figures: dict):
+def render_figures(figures: dict, key_prefix: str = ""):
     if not figures:
         st.info("本次问题没有生成图表。")
         return
     for idx, (name, fig) in enumerate(figures.items()):
         st.markdown(f"**{name}**")
-        st.plotly_chart(fig, width="stretch", key=f"plotly_chart_{idx}_{name}")
+        st.plotly_chart(fig, width="stretch", key=f"{key_prefix}plotly_{idx}_{name}")
 
 
 def render_metrics(elapsed: dict):

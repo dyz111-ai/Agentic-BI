@@ -9,6 +9,7 @@ from sqlalchemy.engine import Engine
 
 from utils.db import timed_read_df, fix_mysql_sql
 from utils.llm import LLMClient
+from utils.conversation_memory import is_follow_up_question, normalize_memory
 from config.data_dictionary import BASE_TABLES, PRE_AGG_TABLES
 
 
@@ -67,23 +68,29 @@ class DataAnalysisAgent:
     def _adapt_sql(self, sql: str) -> str:
         return fix_mysql_sql(sql.strip(), self.engine)
 
-    def analyze(self, question: str) -> DataResult:
+    def analyze(self, question: str, conversation_context: str = "", memory: dict | None = None) -> DataResult:
+        memory = normalize_memory(memory)
         # First choice: LLM intent routing + SQL generation.
         if self.llm.enabled:
             try:
-                return self._llm_analyze(question)
+                return self._llm_analyze(question, conversation_context=conversation_context)
             except Exception as exc:
-                # Keep the app usable if LLM JSON/SQL fails.
-                fallback = self._rule_analyze(question)
+                fallback = self._rule_analyze(question, memory=memory)
                 fallback.routing_method = "fallback"
                 fallback.llm_error = str(exc)
+                self._finalize_result_tables(question, fallback)
                 return fallback
-        # Offline/demo mode.
-        return self._rule_analyze(question)
+        result = self._rule_analyze(question, memory=memory)
+        self._finalize_result_tables(question, result)
+        return result
+
+    def _finalize_result_tables(self, question: str, result: DataResult) -> None:
+        self._normalize_table_columns(result)
+        self._ensure_chart_friendly_tables(question, result)
 
     # ----------------------- LLM planning path -----------------------
-    def _llm_analyze(self, question: str) -> DataResult:
-        plan = self._ask_llm_for_plan(question)
+    def _llm_analyze(self, question: str, conversation_context: str = "") -> DataResult:
+        plan = self._ask_llm_for_plan(question, conversation_context=conversation_context)
         intent = str(plan.get("intent", "custom_sql")).strip()
         if intent not in self.ALLOWED_INTENTS:
             intent = "custom_sql"
@@ -119,9 +126,35 @@ class DataAnalysisAgent:
             raise ValueError("LLM 返回的 SQL 均为空或无法执行")
 
         result.used_preaggregation = bool(result.used_preaggregation and not any_base)
+        self._normalize_table_columns(result)
         self._ensure_chart_friendly_tables(question, result)
         result.summary = self._build_summary(result, plan)
         return result
+
+    def _normalize_table_columns(self, result: DataResult) -> None:
+        """Normalize common LLM column aliases so downstream agents can read tables."""
+        for name, df in list(result.tables.items()):
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            rename: dict[str, str] = {}
+            lower = {str(c).lower(): c for c in df.columns}
+            if "customer_state" not in lower:
+                for alias in ("state", "customer_state_code", "uf"):
+                    if alias in lower:
+                        rename[lower[alias]] = "customer_state"
+                        break
+            if "total_gmv" not in lower:
+                for alias in ("gmv", "sales", "total_sales", "revenue", "total_value"):
+                    if alias in lower:
+                        rename[lower[alias]] = "total_gmv"
+                        break
+            if "year_month" not in lower:
+                for alias in ("month", "order_month", "ym"):
+                    if alias in lower:
+                        rename[lower[alias]] = "year_month"
+                        break
+            if rename:
+                result.tables[name] = df.rename(columns=rename)
 
     def _question_needs_monthly(self, q: str) -> bool:
         keys = [
@@ -250,10 +283,14 @@ class DataAnalysisAgent:
             LIMIT 15
         """
 
-    def _ask_llm_for_plan(self, question: str) -> dict:
+    def _ask_llm_for_plan(self, question: str, conversation_context: str = "") -> dict:
         dialect = self.engine.dialect.name
         ym_col = self._q("year_month")
         schema_text = self._schema_prompt()
+        if conversation_context:
+            question_block = f"{conversation_context.rstrip()}\n{question}"
+        else:
+            question_block = f"用户问题：{question}"
         prompt = f"""
 你是 Agentic BI 系统中的 Data Analysis Agent。你的任务是把中文/英文业务问题转换为可执行 SQL。
 
@@ -304,11 +341,12 @@ class DataAnalysisAgent:
     - map: 巴西地理气泡图，需 customer_state 列
     - heatmap: 交叉热力图，两个类别维度 × 一个数值指标
     charts 是可选的，不确定时可以不输出此字段。
+15. 若提供了【会话上下文】，当前问题可能是追问（如「那个州呢」「该品类差评原因」）。请结合上一轮问题、意图、关键实体与回答，正确理解指代并在 SQL 中使用对应州/品类/卖家等过滤条件。
 
 可用数据字典：
 {schema_text}
 
-用户问题：{question}
+{question_block}
 
 请返回 JSON 格式：
 {{
@@ -463,7 +501,8 @@ charts 根据规则 14 填写，请尽可能填写所需图表，实在不确定
         return " ".join(parts)
 
     # ----------------------- deterministic fallback path -----------------------
-    def _rule_analyze(self, question: str) -> DataResult:
+    def _rule_analyze(self, question: str, memory: dict | None = None) -> DataResult:
+        memory = normalize_memory(memory)
         q = question.lower()
         if self._has_forecast(q):
             return self._forecast_data()
@@ -481,7 +520,28 @@ charts 根据规则 14 填写，请尽可能填写所需图表，实在不确定
             return self._seller()
         if self._is_overall(q):
             return self._overall()
+        if is_follow_up_question(question) and memory.get("last_intent"):
+            routed = self._route_by_intent(memory["last_intent"])
+            if routed is not None:
+                return routed
         return self._sales()
+
+    def _route_by_intent(self, intent: str) -> DataResult | None:
+        routes = {
+            "sales": self._sales,
+            "forecast": self._forecast_data,
+            "delivery": self._delivery,
+            "payment": self._payment,
+            "category": self._category,
+            "seller": self._seller,
+            "review": self._review_data,
+            "weight_freight": self._weight_freight,
+            "overall": self._overall,
+        }
+        handler = routes.get(intent)
+        if handler is None:
+            return None
+        return handler()
 
     def _run(self, name: str, sql: str, params: dict | None = None):
         df, elapsed = timed_read_df(self._adapt_sql(sql), params=params, engine=self.engine)
@@ -536,7 +596,7 @@ charts 根据规则 14 填写，请尽可能填写所需图表，实在不确定
 
     @staticmethod
     def _has_forecast(q: str) -> bool:
-        return any(k in q for k in ["预测", "未来", "forecast", "6周", "六周", "趋势"])
+        return any(k in q for k in ["预测", "未来", "forecast", "6周", "六周", "趋势预测"])
 
     @staticmethod
     def _has_delivery(q: str) -> bool:
