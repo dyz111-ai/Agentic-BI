@@ -140,16 +140,19 @@ class ReviewInsightAgent:
 3. 输出 3-5 个差评原因，每个原因用一句话，包含证据关键词。
 4. 如果样本不足，说明“样本量有限”。
 """
-            text = self.llm.chat(
-                [
-                    {"role": "system", "content": "你是严谨的评论文本分析 Agent，只基于输入样本总结原因。"},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.1,
-                max_tokens=900,
-            )
-            if text and not text.startswith("LLM 调用失败") and "假设" not in text:
-                return self._clean_reason_text(text)
+            try:
+                text = self.llm.chat(
+                    [
+                        {"role": "system", "content": "你是严谨的评论文本分析 Agent，只基于输入样本总结原因。"},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.1,
+                    max_tokens=2048,
+                )
+                if text and not text.startswith("LLM 调用失败") and "假设" not in text:
+                    return self._clean_reason_text(text)
+            except Exception:
+                pass
 
         return self._keyword_reason_summary(negative_keywords)
 

@@ -62,26 +62,43 @@ class LLMClient:
 
         url = f"{self.base_url}/chat/completions"
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        payload = {"model": self.model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}
-        resp = requests.post(url, headers=headers, json=payload, timeout=90)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"LLM 调用失败：HTTP {resp.status_code}，{resp.text[:800]}")
-        data = resp.json()
-        if "error" in data:
-            err = data["error"]
-            msg = err.get("message", err) if isinstance(err, dict) else err
-            raise RuntimeError(f"LLM 调用失败：{msg}")
+        token_budgets = []
+        for t in (max_tokens, max(max_tokens * 2, 2048), 8192):
+            if t not in token_budgets:
+                token_budgets.append(t)
 
-        choices = data.get("choices") or []
-        if not choices:
-            raise RuntimeError("LLM 返回空 choices。")
+        last_error = "LLM 未返回可用文本"
+        for budget in token_budgets:
+            payload = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": budget,
+            }
+            resp = requests.post(url, headers=headers, json=payload, timeout=120)
+            if resp.status_code >= 400:
+                last_error = f"LLM 调用失败：HTTP {resp.status_code}，{resp.text[:800]}"
+                continue
+            data = resp.json()
+            if "error" in data:
+                err = data["error"]
+                msg = err.get("message", err) if isinstance(err, dict) else err
+                last_error = f"LLM 调用失败：{msg}"
+                continue
 
-        message = choices[0].get("message") or {}
-        content = self._extract_message_content(message)
-        if not content:
+            choices = data.get("choices") or []
+            if not choices:
+                last_error = "LLM 返回空 choices。"
+                continue
+
+            message = choices[0].get("message") or {}
+            content = self._extract_message_content(message)
+            if content:
+                return content
             finish = choices[0].get("finish_reason", "unknown")
-            raise RuntimeError(f"LLM 未返回可用文本（finish_reason={finish}）。请增大 max_tokens 或更换模型。")
-        return content
+            last_error = f"LLM 未返回可用文本（finish_reason={finish}，max_tokens={budget}）。"
+
+        raise RuntimeError(f"{last_error} 请增大 max_tokens 或更换模型。")
 
     @staticmethod
     def _extract_message_content(message: dict) -> str:
@@ -91,14 +108,14 @@ class LLMClient:
         reasoning = (message.get("reasoning_content") or "").strip()
         if not reasoning:
             return ""
-        fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", reasoning, flags=re.DOTALL | re.IGNORECASE)
+        fenced = re.search(r"```(?:json)?\s*(\{.*)\s*```?", reasoning, flags=re.DOTALL | re.IGNORECASE)
         if fenced:
             return fenced.group(1).strip()
         if "{" in reasoning:
             start = reasoning.find("{")
-            end = reasoning.rfind("}")
-            if end > start:
-                return reasoning[start : end + 1].strip()
+            fragment = reasoning[start:].strip()
+            if fragment:
+                return fragment
         return ""
 
     @staticmethod

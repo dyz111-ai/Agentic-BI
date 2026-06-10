@@ -23,7 +23,6 @@ class DataResult:
     elapsed: dict[str, float] = field(default_factory=dict)
     routing_method: str = "rule"      # rule / llm / fallback
     plan: dict[str, Any] = field(default_factory=dict)
-    chart_plan: list[dict] = field(default_factory=list)
     llm_error: str = ""
 
 
@@ -86,7 +85,6 @@ class DataAnalysisAgent:
 
     def _finalize_result_tables(self, question: str, result: DataResult) -> None:
         self._normalize_table_columns(result)
-        self._ensure_chart_friendly_tables(question, result)
 
     # ----------------------- LLM planning path -----------------------
     def _llm_analyze(self, question: str, conversation_context: str = "") -> DataResult:
@@ -104,7 +102,6 @@ class DataAnalysisAgent:
             used_preaggregation=bool(plan.get("used_preaggregation", False)),
             routing_method="llm",
             plan=plan,
-            chart_plan=self._extract_chart_plan(plan),
         )
 
         any_base = False
@@ -127,7 +124,6 @@ class DataAnalysisAgent:
 
         result.used_preaggregation = bool(result.used_preaggregation and not any_base)
         self._normalize_table_columns(result)
-        self._ensure_chart_friendly_tables(question, result)
         result.summary = self._build_summary(result, plan)
         return result
 
@@ -155,133 +151,6 @@ class DataAnalysisAgent:
                         break
             if rename:
                 result.tables[name] = df.rename(columns=rename)
-
-    def _question_needs_monthly(self, q: str) -> bool:
-        keys = [
-            "按月", "月度", "每月", "趋势", "monthly", "timeline", "over time",
-            "gmv", "销售额", "销售", "营收", "revenue", "多少", "怎样", "如何",
-        ]
-        return any(k in q for k in keys)
-
-    def _question_needs_state(self, q: str) -> bool:
-        keys = ["各州", "州", "排名", "state", "region", "区域"]
-        return any(k in q for k in keys)
-
-    def _ensure_chart_friendly_tables(self, question: str, result: DataResult) -> None:
-        """补全 LLM 常漏的时间序列/各州汇总结构，避免可视化拿到单行汇总或无 year_month 的表。"""
-        q = question.lower()
-        needs_monthly = self._question_needs_monthly(q)
-        needs_state = self._question_needs_state(q)
-        year_filter = "2017" if "2017" in q else None
-
-        if needs_monthly and not self._has_usable_monthly_data(result.tables):
-            derived = self._derive_monthly_from_tables(result.tables)
-            if derived is not None and not derived.empty:
-                result.tables["monthly_sales"] = derived
-                result.sql_blocks.append({
-                    "name": "monthly_sales",
-                    "sql": "-- derived from state_sales or canonical mv_monthly_sales",
-                    "source": "auto-fix",
-                })
-            else:
-                sql = self._canonical_monthly_sql(year_filter)
-                n, df, elapsed = self._run("monthly_sales", sql)
-                result.tables[n] = df
-                result.sql_blocks.append({"name": n, "sql": sql, "source": "pre-aggregation auto-fix"})
-                result.elapsed[n] = elapsed
-
-        if needs_state and not self._has_usable_state_data(result.tables, year_filter):
-            sql = self._canonical_state_sql(year_filter)
-            name = "state_sales_2017" if year_filter else "state_sales"
-            n, df, elapsed = self._run(name, sql)
-            result.tables[n] = df
-            result.sql_blocks.append({"name": n, "sql": sql, "source": "pre-aggregation auto-fix"})
-            result.elapsed[n] = elapsed
-
-    def _has_usable_monthly_data(self, tables: dict[str, pd.DataFrame]) -> bool:
-        monthly = tables.get("monthly_sales")
-        if self._is_valid_monthly_series(monthly) and not monthly.empty:
-            if self._monthly_has_positive_gmv(monthly):
-                return True
-        return False
-
-    @staticmethod
-    def _monthly_has_positive_gmv(df: pd.DataFrame) -> bool:
-        for col in df.columns:
-            if str(col).lower() in {"total_gmv", "gmv", "sales", "revenue", "total_value"}:
-                vals = pd.to_numeric(df[col], errors="coerce").fillna(0)
-                return bool((vals > 0).any())
-        return False
-
-    def _has_usable_state_data(self, tables: dict[str, pd.DataFrame], year: str | None) -> bool:
-        keys = ("state_sales_2017", "state_sales") if year else ("state_sales", "state_sales_2017")
-        for key in keys:
-            df = tables.get(key)
-            if not isinstance(df, pd.DataFrame) or df.empty:
-                continue
-            if not {"customer_state", "total_gmv"}.issubset(df.columns):
-                continue
-            vals = pd.to_numeric(df["total_gmv"], errors="coerce").fillna(0)
-            if (vals > 0).any():
-                return True
-        return False
-
-    @staticmethod
-    def _is_valid_monthly_series(df: pd.DataFrame | None) -> bool:
-        if df is None or df.empty:
-            return False
-        time_cols = [c for c in df.columns if str(c).lower() in {"year_month", "month", "date", "order_month"}]
-        if not time_cols:
-            return False
-        value_cols = [c for c in df.columns if str(c).lower() in {"total_gmv", "gmv", "sales", "revenue", "total_value"}]
-        return bool(value_cols)
-
-    @staticmethod
-    def _derive_monthly_from_tables(tables: dict[str, pd.DataFrame]) -> pd.DataFrame | None:
-        for key in ("state_sales", "state_sales_2017", "monthly_sales"):
-            df = tables.get(key)
-            if not isinstance(df, pd.DataFrame) or df.empty:
-                continue
-            if "year_month" in df.columns and "total_gmv" in df.columns:
-                out = df.groupby("year_month", as_index=False)["total_gmv"].sum().sort_values("year_month")
-                if not out.empty:
-                    return out
-        return None
-
-    @staticmethod
-    def _has_state_ranking_table(tables: dict[str, pd.DataFrame]) -> bool:
-        for key in ("state_sales", "state_sales_2017"):
-            df = tables.get(key)
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                if {"customer_state", "total_gmv"}.issubset(df.columns):
-                    return True
-        return False
-
-    def _canonical_monthly_sql(self, year: str | None = None) -> str:
-        ym = self._q("year_month")
-        if year:
-            return f"""
-                SELECT {ym}, total_gmv, total_orders, avg_basket, total_freight
-                FROM mv_monthly_sales
-                WHERE {ym} LIKE '{year}-%'
-                ORDER BY {ym}
-            """
-        return f"SELECT {ym}, total_gmv, total_orders, avg_basket, total_freight FROM mv_monthly_sales ORDER BY {ym}"
-
-    def _canonical_state_sql(self, year: str | None = None) -> str:
-        ym = self._q("year_month")
-        where = f"WHERE {ym} LIKE '{year}-%'" if year else ""
-        return f"""
-            SELECT customer_state,
-                   ROUND(SUM(total_gmv), 2) AS total_gmv,
-                   SUM(total_orders) AS total_orders,
-                   SUM(unique_customers) AS unique_customers
-            FROM mv_state_sales
-            {where}
-            GROUP BY customer_state
-            ORDER BY total_gmv DESC
-            LIMIT 15
-        """
 
     def _ask_llm_for_plan(self, question: str, conversation_context: str = "") -> dict:
         dialect = self.engine.dialect.name
@@ -323,25 +192,7 @@ class DataAnalysisAgent:
 11. 若用户问「按月/趋势/月度」：monthly_sales 必须返回 year_month + total_gmv 的时间序列（多行），不要只返回一个 SUM 总数。
 12. 若用户问「各州/排名」：state_sales 或 state_sales_2017 需按 customer_state 汇总 total_gmv，可含 year_month 明细或已聚合结果。
 13. 若数据库方言为 mysql，列名 year_month 必须写成反引号形式 `year_month`（MySQL 保留字 YEAR 会导致语法错误）。
-14. 根据用户问题和查询结果自动规划需要生成的可视化图表，输出 charts 数组：
-    每个 chart 对象格式：
-    {
-      "title": "图表中文标题",
-      "type": "line|bar|pie|scatter|map|heatmap",
-      "table": "使用的表名（必须对应 queries 中的 name）",
-      "x": "x轴列名（可选，缺失时自动推断）",
-      "y": "y轴列名（可选，缺失时自动推断）",
-      "orientation": "h|v（仅 bar 类型需要，默认 v）"
-    }
-    类型说明：
-    - line: 时间序列折线图，x 为 year_month/date，展示趋势
-    - bar: 柱状图/条形图，分类对比排名
-    - pie: 饼图，占比分布
-    - scatter: 散点图，两个数值变量的关系
-    - map: 巴西地理气泡图，需 customer_state 列
-    - heatmap: 交叉热力图，两个类别维度 × 一个数值指标
-    charts 是可选的，不确定时可以不输出此字段。
-15. 若提供了【会话上下文】，当前问题可能是追问（如「那个州呢」「该品类差评原因」）。请结合上一轮问题、意图、关键实体与回答，正确理解指代并在 SQL 中使用对应州/品类/卖家等过滤条件。
+14. 若提供了【会话上下文】，当前问题可能是追问（如「那个州呢」「该品类差评原因」）。请结合上一轮问题、意图、关键实体与回答，正确理解指代并在 SQL 中使用对应州/品类/卖家等过滤条件。
 
 可用数据字典：
 {schema_text}
@@ -355,12 +206,8 @@ class DataAnalysisAgent:
   "reason": "为什么选择这些表",
   "queries": [
     {{"name": "monthly_sales", "source": "pre-aggregation", "sql": "SELECT ..."}}
-  ],
-  "charts": [
-    {{"title": "月度 GMV 趋势", "type": "line", "table": "monthly_sales", "x": "year_month", "y": "total_gmv"}}
   ]
 }}
-charts 根据规则 14 填写，请尽可能填写所需图表，实在不确定时可为空数组 []。
 """
         messages = [
             {"role": "system", "content": "你是严谨的数据分析 SQL Agent。只返回合法 JSON，不要思考过程，不要 Markdown。"},
@@ -400,31 +247,6 @@ charts 根据规则 14 填写，请尽可能填写所需图表，实在不确定
             "products.product_category_name = product_category_name_translation.product_category_name",
         ])
         return "\n".join(lines)
-
-    @staticmethod
-    def _extract_chart_plan(plan: dict) -> list[dict]:
-        charts = plan.get("charts") or []
-        if not isinstance(charts, list):
-            return []
-        valid_types = {"line", "bar", "pie", "scatter", "map", "heatmap"}
-        out: list[dict] = []
-        for c in charts:
-            if not isinstance(c, dict):
-                continue
-            c_type = str(c.get("type", "")).strip().lower()
-            c_table = str(c.get("table", "")).strip()
-            c_title = str(c.get("title", "")).strip()
-            if c_type not in valid_types or not c_table or not c_title:
-                continue
-            entry: dict[str, str] = {"title": c_title, "type": c_type, "table": c_table}
-            if c.get("x"):
-                entry["x"] = str(c["x"]).strip()
-            if c.get("y"):
-                entry["y"] = str(c["y"]).strip()
-            if c.get("orientation") in ("h", "v"):
-                entry["orientation"] = str(c["orientation"]).strip()
-            out.append(entry)
-        return out
 
     def _extract_json(self, content: str) -> dict:
         text = content.strip()
@@ -626,10 +448,6 @@ charts 根据规则 14 填写，请尽可能填写所需图表，实在不确定
         result = DataResult(
             intent="sales",
             used_preaggregation=True,
-            chart_plan=[
-                {"title": "月度 GMV 趋势", "type": "line", "table": "monthly_sales", "x": "year_month", "y": "total_gmv"},
-                {"title": "2017 各州 GMV 排名", "type": "bar", "table": "state_sales_2017", "x": "customer_state", "y": "total_gmv"},
-            ],
         )
         queries = {
             "monthly_sales": self._sql_monthly_all(),
@@ -651,9 +469,6 @@ charts 根据规则 14 填写，请尽可能填写所需图表，实在不确定
         result = DataResult(
             intent="forecast",
             used_preaggregation=True,
-            chart_plan=[
-                {"title": "月度 GMV 趋势与预测", "type": "line", "table": "monthly_sales", "x": "year_month", "y": "total_gmv"},
-            ],
         )
         sql = self._sql_monthly_all()
         n, df, e = self._run("monthly_sales", sql)
@@ -667,9 +482,6 @@ charts 根据规则 14 填写，请尽可能填写所需图表，实在不确定
         result = DataResult(
             intent="delivery",
             used_preaggregation=True,
-            chart_plan=[
-                {"title": "各州配送时长与准时率", "type": "bar", "table": "delivery_by_state", "x": "customer_state", "y": "avg_delivery_days"},
-            ],
         )
         queries = {
             "delivery_by_state": """
@@ -699,9 +511,6 @@ charts 根据规则 14 填写，请尽可能填写所需图表，实在不确定
         result = DataResult(
             intent="payment",
             used_preaggregation=True,
-            chart_plan=[
-                {"title": "支付方式分布", "type": "pie", "table": "payment_dist", "x": "payment_type", "y": "total_transactions"},
-            ],
         )
         queries = {
             "payment_dist": """
@@ -730,9 +539,6 @@ charts 根据规则 14 填写，请尽可能填写所需图表，实在不确定
         result = DataResult(
             intent="category",
             used_preaggregation=True,
-            chart_plan=[
-                {"title": "Top 品类 GMV", "type": "bar", "table": "top_categories", "x": "total_gmv", "y": "product_category_english", "orientation": "h"},
-            ],
         )
         queries = {
             "top_categories": """
@@ -762,9 +568,6 @@ charts 根据规则 14 填写，请尽可能填写所需图表，实在不确定
         result = DataResult(
             intent="seller",
             used_preaggregation=True,
-            chart_plan=[
-                {"title": "低评分卖家 Top 20", "type": "bar", "table": "low_score_sellers", "x": "avg_review_score", "y": "seller_id", "orientation": "h"},
-            ],
         )
         sql = """
             SELECT seller_id, seller_state,
@@ -788,9 +591,6 @@ charts 根据规则 14 填写，请尽可能填写所需图表，实在不确定
         result = DataResult(
             intent="weight_freight",
             used_preaggregation=False,
-            chart_plan=[
-                {"title": "商品重量与运费关系", "type": "scatter", "table": "weight_freight", "x": "product_weight_g", "y": "freight_value"},
-            ],
         )
         sql = """
             SELECT
@@ -814,7 +614,10 @@ charts 根据规则 14 填写，请尽可能填写所需图表，实在不确定
         return result
 
     def _review_data(self) -> DataResult:
-        result = DataResult(intent="review", used_preaggregation=False)
+        result = DataResult(
+            intent="review",
+            used_preaggregation=False,
+        )
         sql = """
             SELECT
                 r.order_id,
@@ -841,13 +644,6 @@ charts 根据规则 14 填写，请尽可能填写所需图表，实在不确定
         result = DataResult(
             intent="overall",
             used_preaggregation=True,
-            chart_plan=[
-                {"title": "月度 GMV 趋势", "type": "line", "table": "monthly_sales", "x": "year_month", "y": "total_gmv"},
-                {"title": "各州 GMV 排名", "type": "bar", "table": "state_sales", "x": "customer_state", "y": "total_gmv"},
-                {"title": "各州配送时长", "type": "bar", "table": "delivery_by_state", "x": "customer_state", "y": "avg_delivery_days"},
-                {"title": "Top 品类 GMV", "type": "bar", "table": "top_categories", "x": "total_gmv", "y": "product_category_english", "orientation": "h"},
-                {"title": "支付方式分布", "type": "pie", "table": "payment_dist", "x": "payment_type", "y": "total_transactions"},
-            ],
         )
         queries = {
             "monthly_sales": self._sql_monthly_all(),

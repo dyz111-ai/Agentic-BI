@@ -28,6 +28,9 @@ EXAMPLES = [
     "帮我全面检查平台目前存在哪些异常问题？需要优先关注的风险有哪些？",
 ]
 
+CHAT_INPUT_KEY = "chat_input_draft"
+EXAMPLE_RADIO_KEY = "example_radio"
+
 
 @st.cache_resource(show_spinner=False)
 def init_engine(db_url: str):
@@ -56,6 +59,98 @@ def _init_session_state() -> None:
         st.session_state.history = []
     if "conversation_memory" not in st.session_state:
         st.session_state.conversation_memory = normalize_memory(None)
+    if "sidebar_selected" not in st.session_state:
+        st.session_state.sidebar_selected = EXAMPLES[0]
+    if EXAMPLE_RADIO_KEY not in st.session_state:
+        st.session_state[EXAMPLE_RADIO_KEY] = st.session_state.sidebar_selected
+    if CHAT_INPUT_KEY not in st.session_state:
+        st.session_state[CHAT_INPUT_KEY] = st.session_state.sidebar_selected
+
+
+def _on_example_change() -> None:
+    selected = st.session_state[EXAMPLE_RADIO_KEY]
+    st.session_state.sidebar_selected = selected
+    st.session_state.pending_chat_fill = selected
+
+
+def _apply_chat_input_session_updates() -> None:
+    """在 st.chat_input 渲染前更新输入框内容（渲染后不可再改同 key 的 session_state）。"""
+    if st.session_state.pop("clear_chat_input", False):
+        st.session_state[CHAT_INPUT_KEY] = ""
+    pending = st.session_state.pop("pending_chat_fill", None)
+    if pending is not None:
+        st.session_state[CHAT_INPUT_KEY] = pending
+
+
+def _is_processing() -> bool:
+    messages = st.session_state.messages
+    return bool(messages and messages[-1].get("loading"))
+
+
+def _enqueue_question(question: str) -> None:
+    """先展示用户问题与加载态，下一轮再执行分析。"""
+    question = question.strip()
+    if not question or _is_processing():
+        return
+    st.session_state.messages.append({"role": "user", "content": question})
+    st.session_state.messages.append({"role": "assistant", "loading": True})
+    st.session_state.clear_chat_input = True
+    st.rerun()
+
+
+def _complete_processing_if_needed() -> None:
+    messages = st.session_state.messages
+    if not messages or not messages[-1].get("loading"):
+        return
+
+    question = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            question = str(msg.get("content") or "").strip()
+            break
+    if not question:
+        messages.pop()
+        st.rerun()
+        return
+
+    try:
+        orch = init_orchestrator(DB_URL)
+        memory = st.session_state.conversation_memory
+        result = orch.handle(question, memory=memory)
+
+        turn_id = len(st.session_state.chat_results)
+        st.session_state.chat_results.append(result)
+        messages[-1] = {
+            "role": "assistant",
+            "result_idx": turn_id,
+            "turn_id": turn_id,
+        }
+
+        key_entities = extract_key_entities(result.data_result, result.nlp_result)
+        st.session_state.conversation_memory = append_turn(
+            result.memory,
+            question=question,
+            intent=result.data_result.intent,
+            tables=list(result.data_result.tables.keys()),
+            direct_answer=getattr(result, "direct_answer", []) or [],
+            findings=getattr(result, "findings", []) or [],
+            recommendations=getattr(result, "recommendations", []) or [],
+            key_entities=key_entities,
+        )
+        _append_history(question, result)
+    except SQLAlchemyError as exc:
+        messages[-1] = {
+            "role": "assistant",
+            "error": True,
+            "content": f"数据库错误：{exc}",
+        }
+    except Exception as exc:
+        messages[-1] = {
+            "role": "assistant",
+            "error": True,
+            "content": f"系统运行失败：{exc}",
+        }
+    st.rerun()
 
 
 def _clear_conversation() -> None:
@@ -63,6 +158,7 @@ def _clear_conversation() -> None:
     st.session_state.chat_results = []
     st.session_state.history = []
     st.session_state.conversation_memory = normalize_memory(None)
+    st.session_state.pending_chat_fill = st.session_state.get(EXAMPLE_RADIO_KEY, EXAMPLES[0])
 
 
 def _append_history(question: str, result) -> None:
@@ -79,62 +175,18 @@ def _append_history(question: str, result) -> None:
     })
 
 
-def _process_question(question: str) -> None:
-    question = question.strip()
-    if not question:
-        return
-
-    st.session_state.messages.append({"role": "user", "content": question})
-
-    try:
-        orch = init_orchestrator(DB_URL)
-        memory = st.session_state.conversation_memory
-        with st.spinner("正在分析数据、生成图表与建议..."):
-            result = orch.handle(question, memory=memory)
-
-        turn_id = len(st.session_state.chat_results)
-        st.session_state.chat_results.append(result)
-        st.session_state.messages.append({
-            "role": "assistant",
-            "result_idx": turn_id,
-            "turn_id": turn_id,
-        })
-
-        key_entities = extract_key_entities(result.data_result, result.nlp_result)
-        st.session_state.conversation_memory = append_turn(
-            result.memory,
-            question=question,
-            intent=result.data_result.intent,
-            tables=list(result.data_result.tables.keys()),
-            direct_answer=getattr(result, "direct_answer", []) or [],
-            findings=getattr(result, "findings", []) or [],
-            recommendations=getattr(result, "recommendations", []) or [],
-            key_entities=key_entities,
-        )
-        _append_history(question, result)
-    except SQLAlchemyError as exc:
-        st.session_state.messages.append({
-            "role": "assistant",
-            "error": True,
-            "content": f"数据库错误：{exc}",
-        })
-    except Exception as exc:
-        st.session_state.messages.append({
-            "role": "assistant",
-            "error": True,
-            "content": f"系统运行失败：{exc}",
-        })
-
-
 _init_session_state()
 
 with st.sidebar:
     st.subheader("推荐测试问题")
-    selected = st.radio("一键选择", EXAMPLES, index=0, label_visibility="collapsed")
-
-    if st.button("发送该问题", use_container_width=True):
-        st.session_state.pending_question = selected
-        st.rerun()
+    selected = st.radio(
+        "一键选择",
+        EXAMPLES,
+        key=EXAMPLE_RADIO_KEY,
+        on_change=_on_example_change,
+        label_visibility="collapsed",
+    )
+    st.session_state.sidebar_selected = selected
 
     if st.button("刷新预聚合表", use_container_width=True):
         try:
@@ -168,6 +220,12 @@ for msg in st.session_state.messages:
     with st.chat_message(role):
         if role == "user":
             st.markdown(msg.get("content", ""))
+        elif msg.get("loading"):
+            with st.status("正在分析数据、生成图表与建议…", expanded=True) as status:
+                st.write("Data Agent 正在查询数据库…")
+                st.write("Visualization Agent 正在生成图表…")
+                st.write("Decision Agent 正在生成决策建议…")
+                status.update(label="分析进行中，请稍候…", state="running")
         elif msg.get("error"):
             st.error(msg.get("content", "分析失败"))
         else:
@@ -178,10 +236,14 @@ for msg in st.session_state.messages:
             else:
                 st.warning("该条回复无法加载，请重新提问。")
 
-pending = st.session_state.pop("pending_question", None)
-user_prompt = st.chat_input("输入业务问题，按 Enter 发送…")
-prompt_to_run = pending or user_prompt
+_complete_processing_if_needed()
 
-if prompt_to_run and prompt_to_run.strip():
-    _process_question(prompt_to_run)
-    st.rerun()
+_apply_chat_input_session_updates()
+
+user_prompt = st.chat_input(
+    "输入业务问题，按 Enter 发送…",
+    key=CHAT_INPUT_KEY,
+    disabled=_is_processing(),
+)
+if user_prompt and user_prompt.strip() and not _is_processing():
+    _enqueue_question(user_prompt)

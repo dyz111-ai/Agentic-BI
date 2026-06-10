@@ -69,32 +69,35 @@ class DecisionIntelligenceAgent:
         local_summary = self._local_summary_from_evidence(evidence)
 
         if self.llm.enabled:
-            prompt = self._build_llm_prompt(question, evidence, conversation_context=conversation_context)
-            text = self.llm.chat(
-                [
-                    {
-                        "role": "system",
-                        "content": (
-                            SYSTEM_PROMPT
-                            + "\n"
-                            + DECISION_AGENT_PROMPT
-                            + "\n你必须严格基于用户提供的查询结果回答，禁止编造数据；回答中禁止出现 evidence_json、JSON、ETL 等内部术语。"
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.1,
-                max_tokens=1400,
-            )
-            if text and not text.startswith("LLM 调用失败"):
-                recs = self._parse_recommendations(text)
-                recs = self._remove_unsafe_or_empty_recs(recs, evidence)
-                recs = self._filter_user_facing_recs(recs, evidence, question)
-                if recs:
-                    return DecisionResult(
-                        recommendations=recs,
-                        summary="已基于真实查询结果、评论洞察和预测结果生成决策建议。",
-                    )
+            try:
+                prompt = self._build_llm_prompt(question, evidence, conversation_context=conversation_context)
+                text = self.llm.chat(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                SYSTEM_PROMPT
+                                + "\n"
+                                + DECISION_AGENT_PROMPT
+                                + "\n你必须严格基于用户提供的查询结果回答，禁止编造数据；回答中禁止出现 evidence_json、JSON、ETL 等内部术语。"
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.1,
+                    max_tokens=4096,
+                )
+                if text and not text.startswith("LLM 调用失败"):
+                    recs = self._parse_recommendations(text)
+                    recs = self._remove_unsafe_or_empty_recs(recs, evidence)
+                    recs = self._filter_user_facing_recs(recs, evidence, question)
+                    if recs:
+                        return DecisionResult(
+                            recommendations=recs,
+                            summary="已基于真实查询结果、评论洞察和预测结果生成决策建议。",
+                        )
+            except Exception:
+                pass
 
         recs = self._rule_based_recommendations_from_evidence(evidence, question)
         return DecisionResult(recommendations=recs, summary=local_summary)

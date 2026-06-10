@@ -41,18 +41,14 @@ def _run_query(engine: Engine, sql: str) -> tuple[pd.DataFrame, float]:
     """Execute query and return DataFrame with elapsed time."""
     start = time.perf_counter()
     with engine.connect() as conn:
-        df = pd.read_sql(text(sql), conn)
+        df = pd.read_sql(sql.strip(), conn)
     elapsed = time.perf_counter() - start
     return df, elapsed
 
 
-def _build_raw_query(dialect: str) -> str:
-    """Build raw JOIN query for performance comparison.
-    
-    This simulates a typical ad-hoc query that joins multiple tables.
-    """
+def _build_raw_state_sales_query(dialect: str) -> str:
+    """各州 GMV：orders + customers + payments 实时 JOIN。"""
     ym = _build_year_month_expr(dialect, "o.order_purchase_timestamp")
-    
     return f"""
         SELECT
             {ym} AS year_month,
@@ -65,6 +61,41 @@ def _build_raw_query(dialect: str) -> str:
         WHERE o.order_purchase_timestamp IS NOT NULL
         GROUP BY {ym}, c.customer_state
         ORDER BY total_gmv DESC
+        LIMIT 20
+    """
+
+
+def _build_raw_monthly_sales_query(dialect: str) -> str:
+    """月度 GMV：orders + payments 实时 JOIN。"""
+    ym = _build_year_month_expr(dialect, "o.order_purchase_timestamp")
+    return f"""
+        SELECT
+            {ym} AS year_month,
+            ROUND(SUM(p.payment_value), 2) AS total_gmv,
+            COUNT(DISTINCT o.order_id) AS total_orders
+        FROM orders o
+        JOIN payments p ON o.order_id = p.order_id
+        WHERE o.order_purchase_timestamp IS NOT NULL
+        GROUP BY {ym}
+        ORDER BY year_month
+    """
+
+
+def _build_raw_payment_dist_query(dialect: str) -> str:
+    """支付方式分布：payments + orders 实时 JOIN。"""
+    ym = _build_year_month_expr(dialect, "o.order_purchase_timestamp")
+    return f"""
+        SELECT
+            {ym} AS year_month,
+            p.payment_type,
+            COUNT(*) AS total_transactions,
+            ROUND(AVG(p.payment_installments), 2) AS avg_installments,
+            ROUND(SUM(p.payment_value), 2) AS total_value
+        FROM payments p
+        JOIN orders o ON p.order_id = o.order_id
+        WHERE o.order_purchase_timestamp IS NOT NULL
+        GROUP BY {ym}, p.payment_type
+        ORDER BY total_value DESC
         LIMIT 20
     """
 
@@ -102,67 +133,128 @@ PREAGG_QUERIES = {
 }
 
 
-def compare_raw_vs_preagg(
+# 三组 Raw vs Pre-agg 对比场景（报告截图建议截这一块）
+COMPARISON_SCENARIOS = [
+    {
+        "id": "state_sales",
+        "title": "各州 GMV 排名",
+        "raw_builder": _build_raw_state_sales_query,
+        "preagg_table": "mv_state_sales",
+        "preagg_query": PREAGG_QUERIES["mv_state_sales"],
+    },
+    {
+        "id": "monthly_sales",
+        "title": "月度 GMV 趋势",
+        "raw_builder": _build_raw_monthly_sales_query,
+        "preagg_table": "mv_monthly_sales",
+        "preagg_query": PREAGG_QUERIES["mv_monthly_sales"],
+    },
+    {
+        "id": "payment_dist",
+        "title": "支付方式分布",
+        "raw_builder": _build_raw_payment_dist_query,
+        "preagg_table": "mv_payment_dist",
+        "preagg_query": PREAGG_QUERIES["mv_payment_dist"],
+    },
+]
+
+
+def _build_raw_query(dialect: str) -> str:
+    """Backward-compatible alias for the state-sales raw query."""
+    return _build_raw_state_sales_query(dialect)
+
+
+def _compare_one_scenario(
     engine: Engine,
-    iterations: int = 3,
-    verbose: bool = True
+    scenario: dict,
+    iterations: int,
+    verbose: bool,
 ) -> dict:
-    """Compare raw JOIN query vs pre-aggregation query performance.
-    
-    Args:
-        engine: SQLAlchemy engine.
-        iterations: Number of iterations to run for each query.
-        verbose: Whether to print detailed results.
-        
-    Returns:
-        Dictionary with comparison results.
-    """
+    """Run one raw vs pre-agg pair and return timing stats."""
     dialect = _get_dialect(engine)
-    
+    raw_query = scenario["raw_builder"](dialect).strip()
+    preagg_query = scenario["preagg_query"].strip()
+
+    raw_times: list[float] = []
+    preagg_times: list[float] = []
+
     if verbose:
-        print(f"Database dialect: {dialect}")
-        print(f"Iterations per query: {iterations}")
-        print("=" * 60)
-    
-    raw_query = _build_raw_query(dialect)
-    preagg_query = PREAGG_QUERIES["mv_state_sales"]
-    
-    raw_times = []
-    preagg_times = []
-    
+        print(f"\n【对比组】{scenario['title']}  (Raw JOIN  vs  {scenario['preagg_table']})")
+        print("-" * 60)
+
     for i in range(iterations):
         _, raw_time = _run_query(engine, raw_query)
         _, preagg_time = _run_query(engine, preagg_query)
         raw_times.append(raw_time)
         preagg_times.append(preagg_time)
         if verbose:
-            print(f"Iteration {i + 1}:")
-            print(f"  Raw JOIN:     {raw_time * 1000:.2f} ms")
-            print(f"  Pre-agg:     {preagg_time * 1000:.2f} ms")
-    
+            print(f"  Iteration {i + 1}:  Raw {raw_time * 1000:8.2f} ms  |  Pre-agg {preagg_time * 1000:8.2f} ms")
+
     avg_raw = sum(raw_times) / len(raw_times)
     avg_preagg = sum(preagg_times) / len(preagg_times)
-    
-    results = {
-        "dialect": dialect,
+    speedup = avg_raw / avg_preagg if avg_preagg > 0 else 0.0
+
+    if verbose:
+        print(f"  → 平均: Raw {avg_raw * 1000:.2f} ms  |  Pre-agg {avg_preagg * 1000:.2f} ms  |  加速 {speedup:.2f}x")
+
+    return {
+        "id": scenario["id"],
+        "title": scenario["title"],
+        "preagg_table": scenario["preagg_table"],
         "iterations": iterations,
         "raw_query_avg_ms": avg_raw * 1000,
         "preagg_query_avg_ms": avg_preagg * 1000,
-        "speedup": avg_raw / avg_preagg if avg_preagg > 0 else 0,
+        "speedup": speedup,
         "raw_query": raw_query,
         "preagg_query": preagg_query,
     }
-    
+
+
+def compare_raw_vs_preagg(
+    engine: Engine,
+    iterations: int = 3,
+    verbose: bool = True,
+) -> dict:
+    """Compare raw JOIN vs pre-aggregation for all configured scenarios."""
+    dialect = _get_dialect(engine)
+
     if verbose:
+        print(f"Database dialect: {dialect}")
+        print(f"Iterations per query: {iterations}")
+        print(f"Comparison groups: {len(COMPARISON_SCENARIOS)}")
         print("=" * 60)
-        print("Summary:")
-        print(f"  Average raw JOIN time:   {avg_raw * 1000:.2f} ms")
-        print(f"  Average pre-agg time:    {avg_preagg * 1000:.2f} ms")
-        if avg_preagg > 0:
-            print(f"  Speedup:                 {results['speedup']:.2f}x")
+
+    scenarios: list[dict] = []
+    for scenario in COMPARISON_SCENARIOS:
+        scenarios.append(_compare_one_scenario(engine, scenario, iterations, verbose))
+
+    if verbose:
+        print("\n" + "=" * 60)
+        print("三组对比汇总（报告可截此表）")
         print("=" * 60)
-    
-    return results
+        print(f"{'场景':<16} {'Raw JOIN (ms)':>14} {'Pre-agg (ms)':>14} {'加速倍数':>10}")
+        print("-" * 60)
+        for row in scenarios:
+            print(
+                f"{row['title']:<16} "
+                f"{row['raw_query_avg_ms']:>14.2f} "
+                f"{row['preagg_query_avg_ms']:>14.2f} "
+                f"{row['speedup']:>9.2f}x"
+            )
+        print("=" * 60)
+
+    # 保持旧字段：第一组（各州 GMV）供兼容
+    first = scenarios[0] if scenarios else {}
+    return {
+        "dialect": dialect,
+        "iterations": iterations,
+        "scenarios": scenarios,
+        "raw_query_avg_ms": first.get("raw_query_avg_ms", 0),
+        "preagg_query_avg_ms": first.get("preagg_query_avg_ms", 0),
+        "speedup": first.get("speedup", 0),
+        "raw_query": first.get("raw_query", ""),
+        "preagg_query": first.get("preagg_query", ""),
+    }
 
 
 def benchmark_preagg_tables(
@@ -271,40 +363,28 @@ def verify_preagg_correctness(
 
 
 def print_sql_examples(dialect: str) -> None:
-    """Print example SQL queries for documentation.
-    
-    Args:
-        dialect: Database dialect ('sqlite' or 'mysql').
-    """
-    ym = _build_year_month_expr(dialect, "timestamp")
-    
+    """Print example SQL queries for documentation."""
     print("\n" + "=" * 60)
     print(f"Example SQL for {dialect.upper()}:")
     print("=" * 60)
     
-    print("\n1. Raw JOIN query (ad-hoc):")
-    print(f"""
-SELECT
-    {ym} AS year_month,
-    c.customer_state,
-    ROUND(SUM(p.payment_value), 2) AS total_gmv,
-    COUNT(DISTINCT o.order_id) AS total_orders
-FROM orders o
-JOIN customers c ON o.customer_id = c.customer_id
-JOIN payments p ON o.order_id = p.order_id
-WHERE o.order_purchase_timestamp IS NOT NULL
-GROUP BY {ym}, c.customer_state
-ORDER BY total_gmv DESC
-LIMIT 20;
-""")
-    
-    print("\n2. Using pre-aggregation table:")
-    print("""
-SELECT year_month, customer_state, total_gmv, total_orders
-FROM mv_state_sales
-ORDER BY total_gmv DESC
-LIMIT 20;
-""")
+    print("\n1. 各州 GMV — Raw JOIN (ad-hoc):")
+    print(_build_raw_state_sales_query(dialect).strip() + ";")
+
+    print("\n2. 各州 GMV — Pre-aggregation:")
+    print(PREAGG_QUERIES["mv_state_sales"].strip() + ";")
+
+    print("\n3. 月度 GMV — Raw JOIN:")
+    print(_build_raw_monthly_sales_query(dialect).strip() + ";")
+
+    print("\n4. 月度 GMV — Pre-aggregation:")
+    print(PREAGG_QUERIES["mv_monthly_sales"].strip() + ";")
+
+    print("\n5. 支付方式 — Raw JOIN:")
+    print(_build_raw_payment_dist_query(dialect).strip() + ";")
+
+    print("\n6. 支付方式 — Pre-aggregation:")
+    print(PREAGG_QUERIES["mv_payment_dist"].strip() + ";")
 
 
 def main(db_url: str, iterations: int = 3, verbose: bool = True) -> dict:
@@ -384,3 +464,7 @@ if __name__ == "__main__":
         print_sql_examples("mysql")
     else:
         main(args.db_url, args.iterations, verbose=not args.quiet)
+
+'''
+python utils/performance_compare.py --db-url sqlite:///data/olist.db
+'''

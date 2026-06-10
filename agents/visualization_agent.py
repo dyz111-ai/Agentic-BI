@@ -2,13 +2,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+import json
 import re
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from sqlalchemy import Engine, text
+from wordcloud import WordCloud
 
 from config.settings import OUTPUT_DIR
+from config.chart_guidance import CHART_PLAN_GUIDANCE
+from utils.llm import LLMClient
 
 
 @dataclass
@@ -16,6 +21,8 @@ class VisualizationResult:
     figures: dict[str, Any] = field(default_factory=dict)
     saved_files: dict[str, str] = field(default_factory=dict)
     summary: str = ""
+    chart_plan: list[dict] = field(default_factory=list)
+    chart_mode: str = ""
 
 
 STATE_COORDS = {
@@ -30,20 +37,15 @@ STATE_COORDS = {
 
 
 class VisualizationAgent:
-    """Dynamic Visualization Agent.
-
-    旧版主要按固定 table key 作图，例如 monthly_sales、payment_dist。
-    新版保留这些专用图，同时增加“字段语义 + 数据类型”的通用推断：
-    - 时间列 + 数值列：折线图
-    - 州/地区列 + 数值列：柱状图/地理气泡图
-    - 品类/支付/卖家等类别列 + 数值列：柱状图或饼图
-    - 两个数值列：散点图
-    - 两个类别列 + 数值列：热力图
-
-    因此 LLM 生成 SQL 即使用 llm_result_1 这类新表名，只要列结构清楚，也能出图。
-    """
+    """Visualization Agent — 根据问题与 Data Agent 返回的数据，规划并渲染图表。"""
 
     MAX_AUTO_FIGURES = 8
+    VALID_CHART_TYPES = {"line", "bar", "pie", "scatter", "map", "heatmap", "delivery", "wordcloud"}
+
+    def __init__(self, engine: Engine | None = None) -> None:
+        self.engine = engine
+        self._geo_centroids: dict[str, tuple[float, float]] | None = None
+        self.llm = LLMClient()
 
     def visualize(
         self,
@@ -55,198 +57,292 @@ class VisualizationAgent:
     ) -> VisualizationResult:
         res = VisualizationResult()
         tables = getattr(data_result, "tables", {}) or {}
-        intent = getattr(data_result, "intent", "overall") or "overall"
+        if not tables:
+            res.summary = "无可用数据，无法生成图表。"
+            return res
 
         if chart_plan:
-            self._execute_chart_plan(chart_plan, tables, res, intent)
+            plan = chart_plan
+            res.chart_mode = "外部传入"
         else:
-            used_tables: set[str] = set()
-            self._add_known_charts(res, tables, nlp_result, forecast_result, used_tables, intent)
-            for table_name, df in tables.items():
-                if len(res.figures) >= self.MAX_AUTO_FIGURES:
-                    break
-                if table_name in used_tables:
-                    continue
-                for title, fig in self._infer_figures_from_dataframe(table_name, df, question=question, intent=intent):
-                    if len(res.figures) >= self.MAX_AUTO_FIGURES:
-                        break
-                    if title not in res.figures:
-                        res.figures[title] = fig
+            plan, res.chart_mode = self._plan_charts(
+                question=question or "",
+                data_result=data_result,
+                nlp_result=nlp_result,
+                forecast_result=forecast_result,
+            )
+        res.chart_plan = plan
 
-        self._add_nlp_charts(res, nlp_result)
-
-        monthly_trend_titles = ("月度 GMV 趋势", "GMV 趋势与预测")
-        has_monthly_trend = any(k in res.figures for k in monthly_trend_titles)
-        if forecast_result is not None and not has_monthly_trend:
-            monthly, consumed = self._resolve_monthly_series(tables)
-            if monthly is not None and len(res.figures) < self.MAX_AUTO_FIGURES:
-                res.figures["GMV 趋势与预测"] = self._monthly_sales_fig(monthly, forecast_result)
+        if plan:
+            self._execute_chart_plan(
+                plan, tables, res,
+                forecast_result=forecast_result,
+                nlp_result=nlp_result,
+            )
+        else:
+            res.summary = "未能生成图表计划。"
 
         self._save_figures(res)
-        res.summary = f"已生成 {len(res.figures)} 个图表。"
+        if res.figures:
+            res.summary = f"已生成 {len(res.figures)} 个图表（{res.chart_mode}）。"
+        elif not res.summary:
+            res.summary = "本次未生成图表。"
         return res
 
-    # ------------------------------------------------------------------
-    # Known charts retained for course verification questions
-    # ------------------------------------------------------------------
-
-    INTENT_ALLOW_MONTHLY = {"sales", "forecast", "overall"}
-    INTENT_ALLOW_STATE   = {"sales", "delivery", "overall"}
-    INTENT_ALLOW_PAYMENT = {"payment", "overall"}
-    INTENT_ALLOW_CATEGORY = {"category", "overall"}
-    INTENT_ALLOW_DELIVERY = {"delivery", "overall"}
-    INTENT_ALLOW_WEIGHT  = {"weight_freight", "overall"}
-
-    def _add_known_charts(
+    def _plan_charts(
         self,
-        res: VisualizationResult,
-        tables: dict[str, pd.DataFrame],
-        nlp_result: Any,
-        forecast_result: Any,
-        used_tables: set[str],
-        intent: str = "",
-    ) -> None:
-        """Generate charts for well-known table names, gated by intent.
+        question: str,
+        data_result: Any,
+        nlp_result: Any = None,
+        forecast_result: Any = None,
+    ) -> tuple[list[dict], str]:
+        if self.llm.enabled:
+            try:
+                plan = self._llm_plan_charts(question, data_result, nlp_result, forecast_result)
+                if plan:
+                    return plan, "大模型规划"
+            except Exception:
+                pass
+        plan = self._rule_plan_charts(data_result, nlp_result, forecast_result)
+        return plan, "规则兜底"
 
-        Intent filtering ensures we don't show payment pie charts when the
-        user only asked about delivery performance.
-        """
-        # ---- monthly GMV trend (sales / forecast / overall only) ----
-        if intent in self.INTENT_ALLOW_MONTHLY:
-            monthly_df, consumed = self._resolve_monthly_series(tables)
-            if monthly_df is not None:
-                res.figures["月度 GMV 趋势"] = self._monthly_sales_fig(monthly_df, forecast_result)
-                used_tables |= consumed
+    def _llm_plan_charts(
+        self,
+        question: str,
+        data_result: Any,
+        nlp_result: Any = None,
+        forecast_result: Any = None,
+    ) -> list[dict]:
+        tables_ctx = self._build_tables_context(data_result.tables or {})
+        intent = getattr(data_result, "intent", "") or ""
+        extras = []
+        if forecast_result is not None:
+            extras.append("已有 Prophet 销售预测结果，月度 line 图会自动叠加预测线，只需规划 1 张月度折线。")
+        if nlp_result is not None:
+            extras.append("已有 NLP 评论分析结果，可规划 wordcloud 或 reviews 的 bar 图。")
+        extra_text = "\n".join(extras) if extras else "无额外 Agent 输出。"
 
-        # ---- state sales ----
-        if intent in self.INTENT_ALLOW_STATE:
-            for key in ("state_sales", "state_sales_2017"):
-                if self._valid(tables.get(key)):
-                    df = self._aggregate_state_sales(tables[key])
-                    if {"customer_state", "total_gmv"}.issubset(df.columns):
-                        title = f"{key.replace('_', ' ').title()} GMV 排名"
-                        res.figures[title] = px.bar(df.head(20), x="customer_state", y="total_gmv", title=title)
-                        if key != "state_sales_2017":
-                            res.figures["各州销售额气泡图"] = self._state_map_fig(df)
-                        used_tables.add(key)
+        prompt = f"""
+你是 Visualization Agent。Data Agent 已完成 SQL 查询，你只负责决定画哪些图。
 
-        # ---- delivery ----
-        if intent in self.INTENT_ALLOW_DELIVERY:
-            if self._valid(tables.get("delivery_by_state")):
-                df = tables["delivery_by_state"]
-                if {"customer_state", "avg_delivery_days"}.issubset(df.columns):
-                    res.figures["配送准时率/时长"] = self._delivery_fig(df)
-                    used_tables.add("delivery_by_state")
+用户问题：{question}
+分析 intent：{intent}
+{extra_text}
 
-        # ---- payment ----
-        if intent in self.INTENT_ALLOW_PAYMENT:
-            if self._valid(tables.get("payment_dist")):
-                df = tables["payment_dist"]
-                if {"payment_type", "total_transactions"}.issubset(df.columns):
-                    res.figures["支付方式分布"] = px.pie(df, names="payment_type", values="total_transactions", title="支付方式分布")
-                    used_tables.add("payment_dist")
+{CHART_PLAN_GUIDANCE}
 
-            if self._valid(tables.get("payment_monthly")):
-                df = tables["payment_monthly"]
-                if {"payment_type", "year_month", "total_transactions"}.issubset(df.columns):
-                    res.figures["支付方式月度热力图"] = self._heatmap(df, index="payment_type", columns="year_month", values="total_transactions", title="支付方式 × 月份交易热力图")
-                    used_tables.add("payment_monthly")
+可用数据表（列名 + 样例行）：
+{tables_ctx}
 
-        # ---- category ----
-        if intent in self.INTENT_ALLOW_CATEGORY:
-            if self._valid(tables.get("top_categories")):
-                df = tables["top_categories"]
-                if {"product_category_english", "total_gmv"}.issubset(df.columns):
-                    res.figures["Top 品类 GMV"] = px.bar(df.head(20), x="total_gmv", y="product_category_english", orientation="h", title="Top 品类 GMV")
-                    used_tables.add("top_categories")
+请返回严格 JSON：
+{{
+  "charts": [
+    {{"title": "图表标题", "type": "line", "table": "monthly_sales", "x": "year_month", "y": "total_gmv"}}
+  ]
+}}
+只返回 JSON，不要 Markdown。
+"""
+        content = self.llm.chat(
+            [
+                {"role": "system", "content": "你是电商 BI 可视化 Agent。只返回合法 JSON。"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+            max_tokens=2048,
+        )
+        parsed = LLMClient.extract_json(content)
+        return self._parse_chart_plan(parsed.get("charts"))
 
-        # ---- weight / freight ----
-        if intent in self.INTENT_ALLOW_WEIGHT:
-            if self._valid(tables.get("weight_freight")):
-                df = tables["weight_freight"].copy()
-                if {"product_weight_g", "freight_value"}.issubset(df.columns):
-                    size_col = "price" if "price" in df.columns else None
-                    kwargs = {}
-                    if "delivery_status" in df.columns:
-                        kwargs["color"] = "delivery_status"
-                    if size_col:
-                        kwargs["size"] = df[size_col].clip(lower=1, upper=df[size_col].quantile(0.95))
-                    res.figures["商品重量 vs 运费"] = px.scatter(df, x="product_weight_g", y="freight_value", title="商品重量与运费关系", **kwargs)
-                    used_tables.add("weight_freight")
+    @staticmethod
+    def _build_tables_context(tables: dict[str, pd.DataFrame]) -> str:
+        blocks: list[str] = []
+        for name, df in tables.items():
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            preview = df.head(3).copy()
+            for col in preview.columns:
+                if pd.api.types.is_float_dtype(preview[col]):
+                    preview[col] = preview[col].round(4)
+                else:
+                    preview[col] = preview[col].map(
+                        lambda v: (str(v)[:80] + "…") if isinstance(v, str) and len(str(v)) > 80 else v
+                    )
+            blocks.append(
+                f"- table={name!r}, rows={len(df)}, columns={list(df.columns)}\n"
+                f"  sample={preview.where(pd.notnull(preview), None).to_dict(orient='records')}"
+            )
+        return "\n".join(blocks) if blocks else "（无表）"
+
+    @staticmethod
+    def _parse_chart_plan(charts: Any) -> list[dict]:
+        if not isinstance(charts, list):
+            return []
+        out: list[dict] = []
+        for c in charts:
+            if not isinstance(c, dict):
+                continue
+            c_type = str(c.get("type", "")).strip().lower()
+            c_table = str(c.get("table", "")).strip()
+            c_title = str(c.get("title", "")).strip()
+            if c_type not in VisualizationAgent.VALID_CHART_TYPES or not c_title:
+                continue
+            if c_type != "wordcloud" and not c_table:
+                continue
+            entry: dict[str, str] = {"title": c_title, "type": c_type, "table": c_table}
+            for key in ("x", "y", "orientation", "variant"):
+                if c.get(key):
+                    entry[key] = str(c[key]).strip()
+            out.append(entry)
+        return out
+
+    def _rule_plan_charts(
+        self,
+        data_result: Any,
+        nlp_result: Any = None,
+        forecast_result: Any = None,
+    ) -> list[dict]:
+        """无 LLM 时的图表计划兜底（与原 Data Agent chart_plan 对齐）。"""
+        tables = data_result.tables or {}
+        intent = getattr(data_result, "intent", "") or ""
+        plan: list[dict] = []
+
+        def has(name: str) -> bool:
+            df = tables.get(name)
+            return isinstance(df, pd.DataFrame) and not df.empty
+
+        if has("monthly_sales"):
+            title = "GMV 趋势与预测" if (forecast_result or intent == "forecast") else "月度 GMV 趋势"
+            plan.append({"title": title, "type": "line", "table": "monthly_sales", "x": "year_month", "y": "total_gmv"})
+        if has("state_sales_2017"):
+            plan.append({"title": "2017 各州 GMV 排名", "type": "bar", "table": "state_sales_2017", "x": "customer_state", "y": "total_gmv"})
+        elif has("state_sales"):
+            plan.append({"title": "各州 GMV 排名", "type": "bar", "table": "state_sales", "x": "customer_state", "y": "total_gmv"})
+            plan.append({"title": "各州销售额气泡图", "type": "map", "table": "state_sales", "y": "total_gmv"})
+        if has("delivery_by_state"):
+            plan.append({"title": "各州配送时长与准时率", "type": "delivery", "table": "delivery_by_state"})
+        if has("payment_dist"):
+            plan.append({"title": "支付方式分布", "type": "pie", "table": "payment_dist", "x": "payment_type", "y": "total_transactions"})
+        if has("top_categories"):
+            plan.append({"title": "Top 品类 GMV", "type": "bar", "table": "top_categories", "x": "total_gmv", "y": "product_category_english", "orientation": "h"})
+        if has("low_score_sellers"):
+            plan.append({"title": "低评分卖家 Top 20", "type": "bar", "table": "low_score_sellers", "x": "avg_review_score", "y": "seller_id", "orientation": "h"})
+        if has("weight_freight"):
+            plan.append({"title": "商品重量与运费关系", "type": "scatter", "table": "weight_freight", "x": "product_weight_g", "y": "freight_value"})
+        if has("reviews") or nlp_result is not None:
+            plan.append({"title": "差评品类 Top10", "type": "bar", "table": "reviews", "orientation": "h"})
+            plan.append({"title": "差评关键词词云", "type": "wordcloud", "table": "", "variant": "negative"})
+            if len(plan) < self.MAX_AUTO_FIGURES:
+                plan.append({"title": "好评关键词词云", "type": "wordcloud", "table": "", "variant": "positive"})
+        return plan[: self.MAX_AUTO_FIGURES]
 
     # ------------------------------------------------------------------
     # LLM chart plan execution
     # ------------------------------------------------------------------
 
-    CHART_TYPES_FOR_INTENT: dict[str, set[str]] = {
-        "sales":        {"line", "bar", "map"},
-        "forecast":     {"line"},
-        "delivery":     {"bar", "map"},
-        "payment":      {"bar", "pie", "heatmap"},
-        "category":     {"bar"},
-        "seller":       {"bar"},
-        "review":       {"bar"},
-        "weight_freight":{"scatter"},
-        "overall":      {"line", "bar", "pie", "scatter", "map", "heatmap"},
-        "custom_sql":   {"line", "bar", "pie", "scatter", "map", "heatmap"},
-    }
-
-    CHART_LIMIT_BY_INTENT: dict[str, int] = {
-        "sales": 3,
-        "forecast": 2,
-        "delivery": 2,
-        "payment": 2,
-        "category": 2,
-        "seller": 2,
-        "review": 2,
-        "weight_freight": 1,
-        "overall": 6,
-        "custom_sql": 4,
-    }
-
     def _execute_chart_plan(
-        self, chart_plan: list[dict], tables: dict[str, pd.DataFrame],
-        res: VisualizationResult, intent: str = "overall",
+        self,
+        chart_plan: list[dict],
+        tables: dict[str, pd.DataFrame],
+        res: VisualizationResult,
+        forecast_result: Any = None,
+        nlp_result: Any = None,
     ) -> None:
-        allowed_types = self.CHART_TYPES_FOR_INTENT.get(intent, self.CHART_TYPES_FOR_INTENT["custom_sql"])
-        max_charts = self.CHART_LIMIT_BY_INTENT.get(intent, 4)
+        seen_line_monthly = False
         for chart in chart_plan:
-            if len(res.figures) >= min(max_charts, self.MAX_AUTO_FIGURES):
+            if len(res.figures) >= self.MAX_AUTO_FIGURES:
                 break
-            chart_type = chart.get("type", "")
-            title = chart.get("title", "")
-            table_name = chart.get("table", "")
-            if not title or not table_name:
-                continue
-            if chart_type not in allowed_types:
-                continue
-
-            df = tables.get(table_name)
-            if not isinstance(df, pd.DataFrame) or df.empty:
+            chart_type = str(chart.get("type", "")).strip().lower()
+            title = str(chart.get("title", "")).strip()
+            table_name = str(chart.get("table", "")).strip()
+            if not title or not chart_type:
                 continue
 
             fig = None
             try:
-                if chart_type == "line":
-                    fig = self._exec_line(chart, df)
-                elif chart_type == "bar":
-                    fig = self._exec_bar(chart, df)
-                elif chart_type == "pie":
-                    fig = self._exec_pie(chart, df)
-                elif chart_type == "scatter":
-                    fig = self._exec_scatter(chart, df)
-                elif chart_type == "map":
-                    fig = self._exec_map(chart, df)
-                elif chart_type == "heatmap":
-                    fig = self._exec_heatmap(chart, df)
+                if chart_type == "wordcloud":
+                    fig = self._exec_wordcloud(chart, nlp_result)
+                elif chart_type == "delivery":
+                    df = tables.get(table_name)
+                    if isinstance(df, pd.DataFrame) and not df.empty:
+                        fig = self._delivery_fig(df)
+                        if title:
+                            fig.update_layout(title=title)
+                elif chart_type == "line" and (
+                    table_name == "monthly_sales" or self._is_monthly_gmv_df(tables.get(table_name, pd.DataFrame()))
+                ):
+                    if seen_line_monthly:
+                        continue
+                    df = tables.get(table_name)
+                    if isinstance(df, pd.DataFrame) and not df.empty:
+                        fig = self._exec_line(chart, df, forecast_result=forecast_result, table_name=table_name)
+                        seen_line_monthly = True
+                elif chart_type == "bar" and table_name == "reviews":
+                    fig = self._exec_review_category_bar(nlp_result, title)
+                else:
+                    df = tables.get(table_name)
+                    if not isinstance(df, pd.DataFrame) or df.empty:
+                        continue
+                    if chart_type == "line":
+                        fig = self._exec_line(chart, df, forecast_result=forecast_result, table_name=table_name)
+                    elif chart_type == "bar":
+                        fig = self._exec_bar(chart, df)
+                    elif chart_type == "pie":
+                        fig = self._exec_pie(chart, df)
+                    elif chart_type == "scatter":
+                        fig = self._exec_scatter(chart, df)
+                    elif chart_type == "map":
+                        fig = self._exec_map(chart, df)
+                    elif chart_type == "heatmap":
+                        fig = self._exec_heatmap(chart, df)
             except Exception:
                 continue
 
             if fig is not None and title not in res.figures:
                 res.figures[title] = fig
 
-    def _exec_line(self, chart: dict, df: pd.DataFrame):
+    def _exec_review_category_bar(self, nlp_result: Any, title: str):
+        if nlp_result is None:
+            return None
+        df = getattr(nlp_result, "top_negative_categories", pd.DataFrame())
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return None
+        if not {"negative_rate", "product_category_english"}.issubset(df.columns):
+            return None
+        return px.bar(
+            df, x="negative_rate", y="product_category_english",
+            orientation="h", title=title or "Top 10 差评品类",
+        )
+
+    def _exec_wordcloud(self, chart: dict, nlp_result: Any):
+        if nlp_result is None:
+            return None
+        variant = str(chart.get("variant", "")).strip().lower()
+        title = str(chart.get("title", "")).strip()
+        if variant == "positive" or "好评" in title:
+            keywords = getattr(nlp_result, "positive_keywords", None)
+            default_title = "好评关键词词云"
+            cmap = "Blues"
+        else:
+            keywords = getattr(nlp_result, "negative_keywords", None)
+            default_title = "差评关键词词云"
+            cmap = "Reds"
+        return self._keyword_wordcloud(keywords, title or default_title, colormap=cmap)
+
+    def _exec_line(
+        self,
+        chart: dict,
+        df: pd.DataFrame,
+        forecast_result: Any = None,
+        table_name: str = "",
+    ):
         title = chart.get("title", "时间趋势")
+        if table_name == "monthly_sales" or self._is_monthly_gmv_df(df):
+            norm = self._normalize_monthly_sales(df)
+            if norm is not None and not norm.empty:
+                fig = self._monthly_sales_fig(norm, forecast_result)
+                if title:
+                    fig.update_layout(title=title)
+                return fig
         x = chart.get("x") or self._find_time_col(df)
         y = chart.get("y") or self._find_metric_col(df)
         if not x or not y:
@@ -255,6 +351,11 @@ class VisualizationAgent:
         if ts.empty:
             return None
         return px.line(ts, x="date", y=y, markers=True, title=title)
+
+    @staticmethod
+    def _is_monthly_gmv_df(df: pd.DataFrame) -> bool:
+        cols = {str(c).lower() for c in df.columns}
+        return "year_month" in cols and bool(cols & {"total_gmv", "gmv", "sales", "revenue"})
 
     def _exec_bar(self, chart: dict, df: pd.DataFrame):
         title = chart.get("title", "柱状图")
@@ -319,123 +420,6 @@ class VisualizationAgent:
             return None
         return self._heatmap(df, index=x, columns=y, values=z, title=title)
 
-    def _add_nlp_charts(self, res: VisualizationResult, nlp_result: Any) -> None:
-        if nlp_result is not None and getattr(nlp_result, "top_negative_categories", pd.DataFrame()).empty is False:
-            df = nlp_result.top_negative_categories
-            if {"negative_rate", "product_category_english"}.issubset(df.columns):
-                res.figures["差评品类 Top10"] = px.bar(df, x="negative_rate", y="product_category_english", orientation="h", title="Top 10 差评品类")
-
-        if nlp_result is not None and getattr(nlp_result, "negative_keywords", None):
-            res.figures["差评关键词"] = self._keyword_bar(nlp_result.negative_keywords, "差评关键词")
-
-        if nlp_result is not None and getattr(nlp_result, "positive_keywords", None):
-            if len(res.figures) < self.MAX_AUTO_FIGURES:
-                res.figures["好评关键词"] = self._keyword_bar(nlp_result.positive_keywords, "好评关键词")
-
-    # ------------------------------------------------------------------
-    # Dynamic chart inference
-    # ------------------------------------------------------------------
-
-    def _infer_figures_from_dataframe(
-        self, table_name: str, df: pd.DataFrame,
-        question: str | None = None, intent: str = "",
-    ) -> list[tuple[str, Any]]:
-        work = self._clean_df(df)
-        if work.empty:
-            return []
-
-        cols = list(work.columns)
-        numeric_cols = list(work.select_dtypes(include="number").columns)
-        categorical_cols = [c for c in cols if c not in numeric_cols and work[c].nunique(dropna=True) <= max(50, min(len(work), 100))]
-
-        figures: list[tuple[str, Any]] = []
-
-        time_col = self._find_time_col(work)
-        value_col = self._find_metric_col(work, prefer=["total_gmv", "gmv", "sales", "revenue", "total_value", "payment_value", "total_orders", "orders", "count"])
-        state_col = self._find_col(work, ["customer_state", "seller_state", "state"])
-        category_col = self._find_col(work, ["product_category_english", "category", "product_category_name"])
-        payment_col = self._find_col(work, ["payment_type"])
-        seller_col = self._find_col(work, ["seller_id", "seller_state"])
-        review_score_col = self._find_col(work, ["review_score", "avg_review_score", "avg_score"])
-        freight_col = self._find_col(work, ["freight_value", "total_freight", "avg_freight"])
-        weight_col = self._find_col(work, ["product_weight_g", "weight"])
-
-        # Intent groups for semantic gating (RC3).
-        _SALES = {"sales", "forecast", "overall", "custom_sql"}
-        _DELIVERY = {"delivery", "overall", "custom_sql"}
-        _PAYMENT = {"payment", "overall", "custom_sql"}
-        _CATEGORY = {"category", "overall", "custom_sql"}
-        _SELLER = {"seller", "overall", "custom_sql"}
-        _REVIEW = {"review", "overall", "custom_sql"}
-        _WEIGHT = {"weight_freight", "overall", "custom_sql"}
-
-        # Time series — only when intent makes sense.
-        if intent in _SALES and time_col and value_col:
-            ts = self._prepare_time_series(work, time_col, value_col)
-            if not ts.empty:
-                figures.append((f"{table_name} 时间趋势", px.line(ts, x="date", y=value_col, markers=True, title=f"{table_name} 时间趋势")))
-
-        # Geographic/state ranking — only when intent aligns.
-        if intent in (_SALES | _DELIVERY) and state_col and value_col:
-            state_df = work.groupby(state_col, as_index=False)[value_col].sum().sort_values(value_col, ascending=False).head(20)
-            figures.append((f"{table_name} 地区排名", px.bar(state_df, x=state_col, y=value_col, title=f"{table_name} 地区排名")))
-            if self._looks_like_brazil_state(work[state_col]):
-                figures.append((f"{table_name} 地区气泡图", self._state_map_fig(state_df.rename(columns={state_col: "customer_state", value_col: "total_gmv"}))))
-
-        # Category ranking.
-        if intent in (_SALES | _CATEGORY) and category_col and value_col:
-            agg = work.groupby(category_col, as_index=False)[value_col].sum().sort_values(value_col, ascending=False).head(20)
-            figures.append((f"{table_name} 品类排名", px.bar(agg, x=value_col, y=category_col, orientation="h", title=f"{table_name} 品类排名")))
-
-        # Payment chart.
-        if intent in _PAYMENT and payment_col and value_col:
-            agg = work.groupby(payment_col, as_index=False)[value_col].sum().sort_values(value_col, ascending=False).head(10)
-            figures.append((f"{table_name} 支付方式分布", px.bar(agg, x=payment_col, y=value_col, title=f"{table_name} 支付方式分布")))
-            if len(agg) <= 10:
-                figures.append((f"{table_name} 支付方式占比", px.pie(agg, names=payment_col, values=value_col, title=f"{table_name} 支付方式占比")))
-
-        # Seller ranking.
-        if intent in _SELLER and seller_col and value_col:
-            agg = work.groupby(seller_col, as_index=False)[value_col].sum().sort_values(value_col, ascending=False).head(20)
-            figures.append((f"{table_name} 卖家排名", px.bar(agg, x=value_col, y=seller_col, orientation="h", title=f"{table_name} 卖家排名")))
-
-        # Review score.
-        if intent in (_REVIEW | _SELLER) and review_score_col and (category_col or seller_col or state_col):
-            group_col = category_col or seller_col or state_col
-            agg = work.groupby(group_col, as_index=False)[review_score_col].mean().sort_values(review_score_col).head(15)
-            figures.append((f"{table_name} 平均评分对比", px.bar(agg, x=review_score_col, y=group_col, orientation="h", title=f"{table_name} 平均评分对比")))
-
-        # Weight / freight scatter.
-        if intent in _WEIGHT and weight_col and freight_col:
-            sample = work[[weight_col, freight_col] + ([category_col] if category_col else [])].dropna().head(5000)
-            kwargs = {"color": category_col} if category_col else {}
-            figures.append((f"{table_name} 重量与运费关系", px.scatter(sample, x=weight_col, y=freight_col, title=f"{table_name} 重量与运费关系", **kwargs)))
-
-        # Generic scatter — only when intent is broad (overall / custom_sql).
-        if intent in {"overall", "custom_sql"} and len(numeric_cols) >= 2 and len(work) >= 2:
-            x_col, y_col = self._choose_scatter_cols(work, numeric_cols)
-            color_col = category_col or state_col or payment_col
-            sample_cols = [x_col, y_col] + ([color_col] if color_col else [])
-            sample = work[sample_cols].dropna().head(5000)
-            if not sample.empty:
-                kwargs = {"color": color_col} if color_col else {}
-                figures.append((f"{table_name} 数值关系散点图", px.scatter(sample, x=x_col, y=y_col, title=f"{table_name} 数值关系散点图", **kwargs)))
-
-        # Matrix heatmap: two category columns + one metric — only overall.
-        if intent in {"payment", "overall", "custom_sql"} and len(categorical_cols) >= 2 and value_col:
-            c1, c2 = self._choose_heatmap_categories(work, categorical_cols)
-            if c1 and c2 and c1 != c2:
-                figures.append((f"{table_name} 交叉热力图", self._heatmap(work, index=c1, columns=c2, values=value_col, title=f"{table_name} 交叉热力图")))
-
-        # Reduce duplicates while preserving order (RC7: always dedupe).
-        unique: list[tuple[str, Any]] = []
-        seen_titles: set[str] = set()
-        for title, fig in figures:
-            if title not in seen_titles:
-                unique.append((title, fig))
-                seen_titles.add(title)
-        return unique[:2]
-
     # ------------------------------------------------------------------
     # Specific figure helpers
     # ------------------------------------------------------------------
@@ -493,14 +477,24 @@ class VisualizationAgent:
                 map_df = map_df.rename(columns={metric: "total_gmv"})
         if "total_orders" not in map_df.columns:
             map_df["total_orders"] = 1
-        map_df["lat"] = map_df["customer_state"].map(lambda s: STATE_COORDS.get(str(s).upper(), (None, None))[0])
-        map_df["lon"] = map_df["customer_state"].map(lambda s: STATE_COORDS.get(str(s).upper(), (None, None))[1])
+        if {"lat", "lon"}.issubset(map_df.columns):
+            map_df["lat"] = pd.to_numeric(map_df["lat"], errors="coerce")
+            map_df["lon"] = pd.to_numeric(map_df["lon"], errors="coerce")
+        else:
+            centroids = self._get_geo_centroids()
+            map_df["lat"] = map_df["customer_state"].map(
+                lambda s: centroids.get(str(s).upper(), (None, None))[0]
+            )
+            map_df["lon"] = map_df["customer_state"].map(
+                lambda s: centroids.get(str(s).upper(), (None, None))[1]
+            )
         map_df = map_df.dropna(subset=["lat", "lon"])
         if map_df.empty:
             return go.Figure().update_layout(title="巴西各州气泡图：无可用经纬度")
         fig = px.scatter_geo(
             map_df, lat="lat", lon="lon", size="total_gmv", color="total_orders",
-            hover_name="customer_state", scope="south america", title="巴西各州销售额/订单量气泡图"
+            hover_name="customer_state", scope="south america",
+            title="巴西各州销售额/订单量气泡图（geolocation 坐标）",
         )
         fig.update_geos(center=dict(lat=-14, lon=-52), projection_scale=3.2)
         return fig
@@ -531,6 +525,70 @@ class VisualizationAgent:
     def _keyword_bar(self, keywords, title):
         df = pd.DataFrame(keywords, columns=["keyword", "count"])
         return px.bar(df, x="count", y="keyword", orientation="h", title=title)
+
+    def _keyword_wordcloud(self, keywords, title: str, colormap: str = "Blues"):
+        freq: dict[str, int] = {}
+        for item in keywords or []:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                word, count = str(item[0]), int(item[1])
+            elif isinstance(item, dict):
+                word = str(item.get("word") or item.get("keyword") or "")
+                count = int(item.get("count") or 0)
+            else:
+                continue
+            if word and count > 0:
+                freq[word] = freq.get(word, 0) + count
+        if not freq:
+            return None
+        try:
+            wc = WordCloud(
+                width=900,
+                height=450,
+                background_color="white",
+                colormap=colormap,
+                max_words=60,
+                prefer_horizontal=0.7,
+            ).generate_from_frequencies(freq)
+            arr = wc.to_array()
+            fig = go.Figure(data=go.Image(z=arr))
+            h, w = arr.shape[0], arr.shape[1]
+            fig.update_layout(
+                title=title,
+                margin=dict(l=10, r=10, t=50, b=10),
+                xaxis=dict(visible=False, range=[0, w]),
+                yaxis=dict(visible=False, range=[h, 0], scaleanchor="x", scaleratio=1),
+            )
+            return fig
+        except Exception:
+            return self._keyword_bar(list(freq.items()), title)
+
+    def _get_geo_centroids(self) -> dict[str, tuple[float, float]]:
+        if self._geo_centroids is not None:
+            return self._geo_centroids
+        centroids = dict(STATE_COORDS)
+        if self.engine is not None:
+            try:
+                geo_df = pd.read_sql(
+                    text(
+                        """
+                        SELECT geolocation_state AS st,
+                               AVG(geolocation_lat) AS lat,
+                               AVG(geolocation_lng) AS lon
+                        FROM geolocation
+                        WHERE geolocation_state IS NOT NULL
+                        GROUP BY geolocation_state
+                        """
+                    ),
+                    self.engine,
+                )
+                for row in geo_df.itertuples(index=False):
+                    st = str(row.st).upper()
+                    if pd.notna(row.lat) and pd.notna(row.lon):
+                        centroids[st] = (float(row.lat), float(row.lon))
+            except Exception:
+                pass
+        self._geo_centroids = centroids
+        return self._geo_centroids
 
     # ------------------------------------------------------------------
     # Utility helpers

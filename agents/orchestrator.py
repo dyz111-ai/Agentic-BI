@@ -80,7 +80,7 @@ class OrchestratorAgent:
     def __init__(self, engine: Engine):
         self.engine = engine
         self.data_agent = DataAnalysisAgent(engine)
-        self.viz_agent = VisualizationAgent()
+        self.viz_agent = VisualizationAgent(engine)
         self.nlp_agent = ReviewInsightAgent()
         self.forecast_agent = ForecastAgent()
         self.decision_agent = DecisionIntelligenceAgent()
@@ -148,7 +148,6 @@ class OrchestratorAgent:
             nlp_result=nlp_result,
             forecast_result=forecast_result,
             question=question,
-            chart_plan=getattr(data_result, "chart_plan", None) or None,
         )
         decision_result = self.decision_agent.generate(
             question,
@@ -665,6 +664,8 @@ class OrchestratorAgent:
   "findings": ["用 1-4 条完整中文句子写出关键发现，必须基于真实数据，禁止空泛套话"]
 }}
 
+注意：direct_answer 和 findings 必须是 JSON 数组（字符串列表），不要写成单个字符串。
+
 硬性规则：
 1. 必须引用查询结果中的具体数字（GMV、州名、月份、评分等）。
 2. 禁止输出「已根据查询结果生成图表」「建议结合图表继续分析」等空话。
@@ -679,11 +680,11 @@ class OrchestratorAgent:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.1,
-            max_tokens=1200,
+            max_tokens=4096,
         )
         parsed = LLMClient.extract_json(content)
-        direct = [str(x).strip() for x in (parsed.get("direct_answer") or []) if str(x).strip()]
-        findings = [str(x).strip() for x in (parsed.get("findings") or []) if str(x).strip()]
+        direct = self._coerce_narrative_lines(parsed.get("direct_answer"))
+        findings = self._coerce_narrative_lines(parsed.get("findings"))
         direct = self._filter_boilerplate(direct)
         findings = self._filter_boilerplate(findings)
         return self._dedupe_lines(direct)[:4], self._dedupe_lines(findings)[:5]
@@ -772,6 +773,32 @@ class OrchestratorAgent:
                 continue
             out.append(line)
         return out
+
+    @staticmethod
+    def _coerce_narrative_lines(value: Any) -> list[str]:
+        """LLM 有时把 direct_answer/findings 写成字符串，直接 iterate 会变成逐字拆分。"""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            text = value.strip()
+            return [text] if text else []
+        if isinstance(value, dict):
+            text = str(value.get("text") or value.get("content") or "").strip()
+            return [text] if text else []
+        if isinstance(value, (list, tuple)):
+            out: list[str] = []
+            for item in value:
+                if isinstance(item, str):
+                    text = item.strip()
+                elif isinstance(item, dict):
+                    text = str(item.get("text") or item.get("content") or "").strip()
+                else:
+                    text = str(item).strip()
+                if text:
+                    out.append(text)
+            return out
+        text = str(value).strip()
+        return [text] if text else []
 
     def _synthesize_direct_answer(
         self,
@@ -952,7 +979,7 @@ class OrchestratorAgent:
             "data_source": "预聚合表 mv_*" if data_result.used_preaggregation else "基础表 / 自定义 SQL",
             "intent": getattr(data_result, "intent", ""),
             "chart_count": len(visualization_result.figures),
-            "chart_mode": "LLM 图表规划" if (getattr(data_result, "chart_plan", None) or None) else "规则推断",
+            "chart_mode": getattr(visualization_result, "chart_mode", None) or "—",
             "llm_error": getattr(data_result, "llm_error", "") or "",
             "returned_tables": orchestration_plan.get("returned_tables", []),
             "orchestrator": "OrchestratorAgent",
@@ -963,7 +990,7 @@ class OrchestratorAgent:
                 "销售预测": {"called": forecast_result is not None, "reason": self._humanize_reasons(orchestration_plan.get("forecast_reason", []))},
                 "What-If 模拟": {"called": what_if_result is not None and what_if_result.has_result, "reason": self._humanize_reasons(orchestration_plan.get("what_if_reason", []))},
                 "异常检测": {"called": anomaly_result is not None and anomaly_result.has_alerts, "reason": self._humanize_reasons(orchestration_plan.get("anomaly_reason", []))},
-                "可视化": {"called": True, "reason": "按返回数据自动选图"},
+                "可视化": {"called": True, "reason": getattr(visualization_result, "chart_mode", None) or "按问题与数据选图"},
                 "决策智能": {"called": True, "reason": "综合各 Agent 输出"},
             },
             "notes": orchestration_plan.get("notes", []),
