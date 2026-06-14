@@ -24,6 +24,8 @@ class DataResult:
     routing_method: str = "rule"      # rule / llm / fallback
     plan: dict[str, Any] = field(default_factory=dict)
     llm_error: str = ""
+    # preagg vs raw JOIN timing comparison; populated when used_preaggregation=True
+    preagg_comparison: dict | None = None
 
 
 class DataAnalysisAgent:
@@ -72,15 +74,16 @@ class DataAnalysisAgent:
         # First choice: LLM intent routing + SQL generation.
         if self.llm.enabled:
             try:
-                return self._llm_analyze(question, conversation_context=conversation_context)
+                result = self._llm_analyze(question, conversation_context=conversation_context)
             except Exception as exc:
-                fallback = self._rule_analyze(question, memory=memory)
-                fallback.routing_method = "fallback"
-                fallback.llm_error = str(exc)
-                self._finalize_result_tables(question, fallback)
-                return fallback
-        result = self._rule_analyze(question, memory=memory)
-        self._finalize_result_tables(question, result)
+                result = self._rule_analyze(question, memory=memory)
+                result.routing_method = "fallback"
+                result.llm_error = str(exc)
+                self._finalize_result_tables(question, result)
+        else:
+            result = self._rule_analyze(question, memory=memory)
+            self._finalize_result_tables(question, result)
+        result.preagg_comparison = self._build_preagg_comparison(result)
         return result
 
     def _finalize_result_tables(self, question: str, result: DataResult) -> None:
@@ -368,6 +371,139 @@ class DataAnalysisAgent:
     def _run(self, name: str, sql: str, params: dict | None = None):
         df, elapsed = timed_read_df(self._adapt_sql(sql), params=params, engine=self.engine)
         return name, df, elapsed
+
+    # -------- preagg vs raw JOIN comparison --------
+    _PREAGG_TO_SCENARIO = {
+        "mv_monthly_sales": "monthly_sales",
+        "mv_state_sales":   "state_sales",
+        "mv_payment_dist":  "payment_dist",
+        "mv_delivery_perf": "delivery_perf",
+        "mv_category_sales": "category_sales",
+        "mv_seller_perf":   "seller_perf",
+    }
+
+    def _raw_sql_for(self, mv_table: str) -> tuple[str, str] | None:
+        """Return (scenario_title, raw_join_sql) for a given mv_* table, or None."""
+        dialect = self._dialect
+        def ym(col: str) -> str:
+            return f"strftime('%Y-%m', {col})" if dialect == "sqlite" else f"DATE_FORMAT({col}, '%Y-%m')"
+
+        if mv_table == "mv_state_sales":
+            return ("各州 GMV 排名", f"""
+                SELECT {ym('o.order_purchase_timestamp')} AS year_month,
+                       c.customer_state,
+                       ROUND(SUM(p.payment_value), 2) AS total_gmv,
+                       COUNT(DISTINCT o.order_id) AS total_orders
+                FROM orders o
+                JOIN customers c ON o.customer_id = c.customer_id
+                JOIN payments p  ON o.order_id = p.order_id
+                WHERE o.order_purchase_timestamp IS NOT NULL
+                GROUP BY {ym('o.order_purchase_timestamp')}, c.customer_state
+                ORDER BY total_gmv DESC LIMIT 20""")
+        if mv_table == "mv_monthly_sales":
+            return ("月度 GMV 趋势", f"""
+                SELECT {ym('o.order_purchase_timestamp')} AS year_month,
+                       ROUND(SUM(p.payment_value), 2) AS total_gmv,
+                       COUNT(DISTINCT o.order_id) AS total_orders
+                FROM orders o
+                JOIN payments p ON o.order_id = p.order_id
+                WHERE o.order_purchase_timestamp IS NOT NULL
+                GROUP BY {ym('o.order_purchase_timestamp')}
+                ORDER BY year_month""")
+        if mv_table == "mv_payment_dist":
+            return ("支付方式分布", f"""
+                SELECT {ym('o.order_purchase_timestamp')} AS year_month,
+                       p.payment_type,
+                       COUNT(*) AS total_transactions,
+                       ROUND(AVG(p.payment_installments), 2) AS avg_installments,
+                       ROUND(SUM(p.payment_value), 2) AS total_value
+                FROM payments p
+                JOIN orders o ON p.order_id = o.order_id
+                WHERE o.order_purchase_timestamp IS NOT NULL
+                GROUP BY {ym('o.order_purchase_timestamp')}, p.payment_type
+                ORDER BY total_value DESC LIMIT 20""")
+        if mv_table == "mv_delivery_perf":
+            diff = ("julianday(o.order_delivered_customer_date) - julianday(o.order_purchase_timestamp)"
+                    if dialect == "sqlite" else
+                    "DATEDIFF(o.order_delivered_customer_date, o.order_purchase_timestamp)")
+            return ("配送绩效分析", f"""
+                SELECT {ym('o.order_purchase_timestamp')} AS year_month,
+                       c.customer_state,
+                       ROUND(AVG(CASE WHEN o.order_delivered_customer_date IS NOT NULL
+                                 THEN {diff} END), 2) AS avg_delivery_days,
+                       COUNT(DISTINCT o.order_id) AS total_orders
+                FROM orders o
+                JOIN customers c ON o.customer_id = c.customer_id
+                WHERE o.order_purchase_timestamp IS NOT NULL
+                GROUP BY {ym('o.order_purchase_timestamp')}, c.customer_state
+                ORDER BY avg_delivery_days DESC LIMIT 20""")
+        if mv_table == "mv_category_sales":
+            return ("品类销售分析", f"""
+                SELECT {ym('o.order_purchase_timestamp')} AS year_month,
+                       COALESCE(t.product_category_name_english, p.product_category_name, 'unknown') AS category,
+                       ROUND(SUM(oi.price + oi.freight_value), 2) AS total_gmv,
+                       COUNT(DISTINCT oi.order_id) AS total_orders
+                FROM order_items oi
+                JOIN orders o ON oi.order_id = o.order_id
+                LEFT JOIN products p ON oi.product_id = p.product_id
+                LEFT JOIN product_category_name_translation t ON p.product_category_name = t.product_category_name
+                WHERE o.order_purchase_timestamp IS NOT NULL
+                GROUP BY {ym('o.order_purchase_timestamp')}, category
+                ORDER BY total_gmv DESC LIMIT 20""")
+        if mv_table == "mv_seller_perf":
+            return ("卖家绩效分析", f"""
+                SELECT {ym('o.order_purchase_timestamp')} AS year_month,
+                       s.seller_id,
+                       ROUND(SUM(oi.price + oi.freight_value), 2) AS total_gmv,
+                       COUNT(DISTINCT oi.order_id) AS total_orders,
+                       ROUND(AVG(r.review_score), 2) AS avg_review_score
+                FROM order_items oi
+                JOIN orders o ON oi.order_id = o.order_id
+                LEFT JOIN sellers s ON oi.seller_id = s.seller_id
+                LEFT JOIN order_reviews r ON oi.order_id = r.order_id
+                WHERE o.order_purchase_timestamp IS NOT NULL
+                GROUP BY {ym('o.order_purchase_timestamp')}, s.seller_id
+                ORDER BY avg_review_score ASC LIMIT 20""")
+        return None
+
+    def _build_preagg_comparison(self, result: DataResult) -> dict | None:
+        """Run raw JOIN equivalent for the first preagg table found in sql_blocks."""
+        if not result.used_preaggregation or not result.sql_blocks:
+            return None
+        # find the first mv_* table referenced in any SQL block
+        mv_table = None
+        preagg_sql_used = ""
+        preagg_elapsed = 0.0
+        for block in result.sql_blocks:
+            sql_lower = block.get("sql", "").lower()
+            for tbl in self._PREAGG_TO_SCENARIO:
+                if tbl in sql_lower:
+                    mv_table = tbl
+                    preagg_sql_used = block.get("sql", "")
+                    preagg_elapsed = result.elapsed.get(block.get("name", ""), 0.0)
+                    break
+            if mv_table:
+                break
+        if not mv_table:
+            return None
+        raw_info = self._raw_sql_for(mv_table)
+        if not raw_info:
+            return None
+        scenario_title, raw_sql = raw_info
+        try:
+            _, raw_elapsed = timed_read_df(self._adapt_sql(raw_sql), engine=self.engine)
+        except Exception:
+            return None
+        speedup = raw_elapsed / preagg_elapsed if preagg_elapsed > 0 else 0.0
+        return {
+            "scenario_title": scenario_title,
+            "preagg_table":   mv_table,
+            "preagg_sql":     preagg_sql_used,
+            "raw_sql":        raw_sql.strip(),
+            "preagg_ms":      preagg_elapsed * 1000,
+            "raw_ms":         raw_elapsed * 1000,
+            "speedup":        speedup,
+        }
 
     def _sql_monthly_all(self) -> str:
         ym = self._q("year_month")

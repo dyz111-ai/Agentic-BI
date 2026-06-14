@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import streamlit as st
 import pandas as pd
+import plotly.graph_objects as go
 
 _USER_UNAVAILABLE_PHRASES = (
     "当前查询未返回",
@@ -172,6 +173,7 @@ def render_report(result, key_prefix: str = ""):
         render_recommendations(recommendations)
         render_what_if(getattr(result, "what_if_result", None))
         render_anomaly(getattr(result, "anomaly_result", None))
+        render_preagg_comparison(getattr(result.data_result, "preagg_comparison", None))
         render_technical_details(getattr(result, "technical_details", {}) or {})
         render_metrics(getattr(result.data_result, "elapsed", {}) or {})
 
@@ -304,3 +306,54 @@ def render_metrics(elapsed: dict):
     cols = st.columns(min(4, len(elapsed)))
     for col, (k, v) in zip(cols, elapsed.items()):
         col.metric(k, f"{v * 1000:.1f} ms")
+
+
+def render_preagg_comparison(cmp: dict | None):
+    """Show a bar chart comparing preagg query time vs raw JOIN time."""
+    if not cmp:
+        return
+    preagg_ms = cmp.get("preagg_ms", 0.0)
+    raw_ms = cmp.get("raw_ms", 0.0)
+    speedup = cmp.get("speedup", 0.0)
+    title = cmp.get("scenario_title", "")
+    table = cmp.get("preagg_table", "")
+
+    st.markdown("---")
+    st.markdown("#### ⚡ 预聚合加速效果（本次查询实测）")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("预聚合表耗时", f"{preagg_ms:.2f} ms", delta=None)
+    c2.metric("等价 Raw JOIN 耗时", f"{raw_ms:.2f} ms", delta=None)
+    c3.metric("加速倍数", f"{speedup:.1f} ×",
+              delta=f"命中 {table}",
+              delta_color="normal")
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        y=["Raw JOIN（实时多表聚合）", f"预聚合表（{table}）"],
+        x=[raw_ms, preagg_ms],
+        orientation="h",
+        marker_color=["#EF553B", "#00CC96"],
+        text=[f"{raw_ms:.2f} ms", f"{preagg_ms:.2f} ms"],
+        textposition="outside",
+        hovertemplate="%{y}<br>耗时：%{x:.2f} ms<extra></extra>",
+    ))
+    fig.update_layout(
+        title=f"查询耗时对比：{title}",
+        xaxis_title="响应时间 (ms)",
+        height=180,
+        margin=dict(l=0, r=60, t=40, b=0),
+        plot_bgcolor="white",
+        xaxis=dict(showgrid=True, gridcolor="#EEEEEE"),
+        showlegend=False,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander("查看对比 SQL", expanded=False):
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.caption(f"✅ 预聚合查询（{table}）")
+            st.code(cmp.get("preagg_sql", ""), language="sql")
+        with col_b:
+            st.caption("🔄 等价 Raw JOIN（实时聚合）")
+            st.code(cmp.get("raw_sql", ""), language="sql")
